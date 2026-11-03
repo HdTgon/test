@@ -1,5 +1,5 @@
 # Imported from Artificer-AI-Lab/MoRAM XTAIL/utils.py.
-# LR functions are unchanged; LoRA I/O adds device/dtype safety and task metadata.
+# LR functions are unchanged; LoRA I/O adds device/dtype safety.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -48,8 +48,8 @@ def accuracy(output, target, topk=(1,)):
     ]
 
 
-def torch_save_lora(model, save_path, lora_module=None, *, extra_state=None):
-    """Save MoRAM factors/ranks, optionally with trainer prototype/task metadata."""
+def torch_save_lora(model, save_path, lora_module=None):
+    """Save only MoRAM factors and ranks."""
     if os.path.dirname(save_path):
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
     lora_params = ['lora_A', 'lora_B', 'lora_scaling', 'old_lora_A', 'old_lora_B',
@@ -64,10 +64,6 @@ def torch_save_lora(model, save_path, lora_module=None, *, extra_state=None):
                                         init_rank=module.init_rank,
                                         lora_scaling=module.lora_scaling)
     checkpoint = dict(state_dict=lora_state_dict, lora_ranks=lora_ranks)
-    if extra_state:
-        if set(extra_state) & set(checkpoint):
-            raise ValueError('extra_state cannot override state_dict/lora_ranks')
-        checkpoint.update(extra_state)
     torch.save(checkpoint, save_path)
     print('Checkpoint saved to', save_path)
 

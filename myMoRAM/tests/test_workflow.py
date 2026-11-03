@@ -49,7 +49,7 @@ class WorkflowTests(unittest.TestCase):
             if n in initial: torch.testing.assert_close(p,initial[n],rtol=0,atol=0)
         checkpoint=str(Path(self.tmp.name)/'checkpoint.pth.tar')
         checkpoint_state=torch.load(checkpoint,weights_only=True)
-        self.assertNotIn('model',checkpoint_state)
+        self.assertEqual(set(checkpoint_state),{'state_dict','lora_ranks'})
         self.assertIn('lora_ranks',checkpoint_state)
         self.assertTrue(all(not k.endswith(('.weight','.bias')) for k in checkpoint_state['state_dict']))
         resume=self.cfg.clone();resume.dataset='caltech101';resume.model_dir=self.tmp.name;resume.continue_train=True
@@ -60,9 +60,6 @@ class WorkflowTests(unittest.TestCase):
         resumed.train()
         self.assertEqual(resumed.completed_tasks,2)
         self.assertEqual(len(resumed.seen_prompts),4)
-        self.assertEqual(resumed.image_prototypes.shape,(4,16))
-        self.assertEqual(resumed.zero_shot_text_prototypes.shape,(4,16))
-        self.assertEqual(resumed.prototype_counts.tolist(),[2,2,2,2])
         from clip import clip
         from models.models import MoRAM_CLIP
         final=self.cfg.clone()
@@ -88,33 +85,6 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(step.call_count,2)
             self.assertTrue(all(torch.isfinite(p).all() for p in trainer.model.parameters()))
             self.assertTrue(any(not torch.equal(p,before[n]) for n,p in trainer.model.named_parameters() if n in before))
-
-    def test_zero_shot_prototype_cache_and_centroid(self):
-        trainer=Trainer(self.cfg)
-        cache_path=Path(self.tmp.name)/'zero_shot_prototypes/aircraft.pth'
-        self.assertTrue(cache_path.exists())
-        cached=torch.load(cache_path,weights_only=True)
-        self.assertEqual(cached['counts'].tolist(),[2,2])
-        torch.testing.assert_close(cached['image_prototypes'].norm(dim=-1),torch.ones(2))
-        sums=torch.zeros(2,16)
-        with torch.no_grad():
-            for images,labels in trainer.train_loader4updating:
-                features=F.normalize(trainer.clip_model.encode_image(images),dim=-1)
-                sums.index_add_(0,labels,features)
-        torch.testing.assert_close(cached['image_prototypes'],F.normalize(sums/2,dim=-1))
-        with patch.object(trainer.clip_model,'encode_image',side_effect=AssertionError('cache hit must not encode')):
-            reused=trainer.load_or_extract_zero_shot_prototypes(self.tmp.name)
-            torch.testing.assert_close(reused['image_prototypes'],cached['image_prototypes'],rtol=0,atol=0)
-        rng=torch.get_rng_state()
-        with patch.object(trainer.clip_model,'encode_image',wraps=trainer.clip_model.encode_image) as encode:
-            rebuilt=trainer.load_or_extract_zero_shot_prototypes(self.tmp.name,force=True)
-            self.assertGreater(encode.call_count,0)
-        torch.testing.assert_close(torch.get_rng_state(),rng,rtol=0,atol=0)
-        torch.testing.assert_close(rebuilt['image_prototypes'],cached['image_prototypes'],rtol=0,atol=0)
-        trainer.cfg.num_shots=2
-        with patch.object(trainer.clip_model,'encode_image',wraps=trainer.clip_model.encode_image) as encode:
-            trainer.load_or_extract_zero_shot_prototypes(self.tmp.name)
-            self.assertGreater(encode.call_count,0)
 
     def test_upstream_optimizer_schedule_and_loss_recipe(self):
         parameter=torch.nn.Parameter(torch.randn(2,3))

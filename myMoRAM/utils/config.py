@@ -72,4 +72,3 @@ _C.prec = "fp32"
 _C.lr = 0.0005
 _C.batch_size = 64
 
-_C.zero_shot_prototype_dir = ""  # default: output_dir/zero_shot_prototypes

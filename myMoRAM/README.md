@@ -1,33 +1,39 @@
-# myMoRAM：保持 LADA 项目流程，只替换模型与训练配方
+# myMoRAM
 
-`main.py` 与 MaolinLuo/LADA 原文件逐字一致。沿用 LADA 的 YACS 配置、随机种子设置、日志文件命名、model_dir、zero-shot 分支和单任务 Trainer 调用。
+以 LADA 项目为基础，只替换模型及 MoRAM 必需的训练逻辑。
 
-- `scenario_datasets/`：LADA 原始数据流程。
-- `models/`：仅 `models.py`，为已完成的 ZeroShotCLIP / MoRAM_CLIP 与自定义 LoRA。
-- `clip/`：LADA CLIP，仅 FFN 前向增加 MoRAM tuple 解包。
-- `trainer.py`：接入模型，并使用用户上传的 MoRAM 训练逻辑；不使用 LADA 的 Text_Tuner/DPT/LADA 分类分支、epoch/OneCycleLR。
-- `result_process.py`：LADA 原始结果汇总；评估输出兼容其日志格式。
+- `main.py` 与 LADA 原版一致。
+- `scenario_datasets/` 保留 LADA 的数据流程。
+- `models/` 仅 `models.py`，包含 ZeroShotCLIP、MoRAM_CLIP 和 routed LoRA。
+- `clip/` 基于 LADA，FFN 前向增加 MoRAM tuple 解包。
+- `trainer.py` 保留 LADA 的方法结构、数据加载、日志及测试流程；模型、优化器、调度器、损失改用 MoRAM。
+- 不提取、不缓存、不保存任何视觉/文本类别原型，没有 DPT、GMM 或 LADA 分支。
 
-## 按你的实际实验脚本设置参数
+## 参数
 
-`configs/model/moram_vit_b16.yaml` 默认对应你提供的 shell：
+`configs/model/moram_vit_b16.yaml` 对应用户实际实验脚本：
 
-| 参数 | 默认值 |
-|---|---|
-| backbone / prec | CLIP-ViT-B/16 / fp32 |
-| rank / topk | 16 / 16 |
-| target_encoder | all |
-| target_modules | q_proj, k_proj, v_proj, out_proj, ffn_in, ffn_out（qkvoinout） |
-| lr / iterations | 0.0005 / 500 |
-| temp / prune_thre | 0.01 / 0.2 |
-| wd / ls / warmup_length | 0 / 0 / 0 |
-| batch_size | 64（LADA 与原 MoRAM 默认一致） |
+```yaml
+backbone: "CLIP-ViT-B/16"
+prec: "fp32"
+iterations: 500
+lr: 0.0005
+wd: 0.0
+ls: 0.0
+warmup_length: 0
+target_encoder: "all"
+target_modules: ["q_proj", "k_proj", "v_proj", "out_proj", "ffn_in", "ffn_out"]
+rank: 16
+topk: 16
+temp: 0.01
+prune_thre: 0.2
+```
 
-`method=moram` 是固定模型选择；`RAIL` 在你给的脚本中仅为实验目录名，不额外引入 RAIL 算法。数据、seed、gpu、num_workers 等保留 LADA 对应设置（seed=0，gpu=0，num_workers=8）。
+batch_size=64；数据、seed、gpu、num_workers 等沿用 LADA 配置。qkvoinout 已展开为上述六种目标。
 
-## 与 LADA 相同的运行方式
+## 运行
 
-先安装配套 torch/torchvision 与 requirements.txt，按上游 LADA 说明准备 X-TAIL 数据，将 `configs/data/TAIL.yaml` 和 `TAIL_order2.yaml` 的 root 改成你的数据根目录。
+安装配套 torch/torchvision 和 requirements.txt，按 LADA 说明准备 X-TAIL 数据，将 configs/data 中的 root 设置为数据目录。
 
 ```bash
 cd myMoRAM
@@ -35,50 +41,47 @@ pip install -r requirements.txt
 bash scripts/run_TAIL_16shot.sh
 ```
 
-和 LADA 一样每条 main 命令只训练一个 dataset，脚本依次调用十次：
+和 LADA 一样，每次 main 只运行一个 dataset：
 
 ```bash
-# 第一任务：从 OpenAI backbone 开始，不读旧的持续学习 checkpoint。
 python main.py -d TAIL -m moram_vit_b16 \
-  num_shots 16 dataset aircraft continue_train_first True output_dir TAIL_16shot
-
-# 第二任务：配置中 continue_train=True，自动读 output/TAIL_16shot/checkpoint.pth.tar。
+  dataset aircraft continue_train_first True output_dir TAIL_16shot
 python main.py -d TAIL -m moram_vit_b16 \
-  num_shots 16 dataset caltech101 output_dir TAIL_16shot
-
-# 十个任务结束后使用原 LADA 汇总方式。
+  dataset caltech101 output_dir TAIL_16shot
 python result_process.py -d TAIL --output_dir TAIL_16shot
 ```
 
-root 可像 LADA 一样用 YACS overrides 覆盖：`root /absolute/path/to/data`。同一份本地 OpenAI 权重可通过 `checkpoint_path /absolute/path/to/ViT-B-16.pt` 指定，后续任务应保持相同配置。
+root 和本地 backbone 可用 `root /path/to/data checkpoint_path /path/to/ViT-B-16.pt` 覆盖。提供 order2、fullshot 和 zero-shot 脚本；冻结 zero-shot 使用 `python main.py -d TAIL -m zs_clip_vit_b16`。
 
-其他脚本：`run_TAIL_16shot_order2.sh`、`run_TAIL_fullshot.sh`、`run_TAIL_fullshot_order2.sh`；仅替换模型名称并移除不再用于 MoRAM 的 num_epochs 参数，其余任务顺序与 LADA 一致。
+## 训练与评估
 
-```bash
-bash scripts/run_TAIL_zeroshot.sh
-# 等价于 python main.py -d TAIL -m zs_clip_vit_b16
+MoRAM 使用固定迭代、AdamW（betas=(0.9,0.9999)）、原版 warmup/cosine、旧类别 logits 屏蔽及 image/text 双向 CE。vision/all 使用两项之和，text-only 使用 image CE。fp32 无 autocast；多任务使用 ls=0 避免与 -inf 屏蔽冲突。
+
+历史类别与 prompts 从 dataset_sequence 和 LADA 类别排列推导，不依赖 checkpoint 元数据。历史文本只在训练当前任务时临时编码缓存；评估按需用当前训练模型编码已见类别，用冻结 CLIP 编码未见类别，不存储文本原型。logit_scale 只取一次指数。
+
+AverageMeter、ETA、当前任务/zero-shot/带和不带 selector 的评估与 LADA 方法结构保持一致。Evaluator 仅额外保护无预测任务的 precision 零分母。
+
+## 只保存 MoRAM
+
+`utils/moram_utils.py` 来自上游 MoRAM XTAIL/utils.py；三个学习率函数与原版一致。Trainer 直接调用其中的调度和保存/加载函数，scheduler.py 仅作兼容 re-export。
+
+```python
+@torch.no_grad()
+def save_model(self, directory):
+    save_path = os.path.join(directory, 'checkpoint.pth.tar')
+    torch_save_lora(self.model, save_path, MoRAM_Linear)
+
+@torch.no_grad()
+def load_model4CL(self, directory, load_path=None):
+    load_path = load_path or os.path.join(directory, 'checkpoint.pth.tar')
+    if not os.path.exists(load_path):
+        raise FileNotFoundError(...)
+    torch_load_lora(self.model, load_path, MoRAM_Linear)
 ```
 
-## 训练保留 MoRAM
+Checkpoint **只有** `state_dict` 与 `lora_ranks`：不保存整个 CLIP、原型、配置、任务进度或 prompts。LoRA ranks 中包含当前/历史 rank、init_rank、lora_scaling；张量包含当前/历史 A/B 与 gate 等 MoRAM 状态。
 
-- 每任务 500 个 optimizer steps，数据耗尽后重建 iterator。
-- AdamW：lr=5e-4、wd=0、betas=(0.9,0.9999)。
-- 原 MoRAM cosine_lr，每步更新，支持 warmup_length。
-- 任务切换时归档旧 LoRA、新建当前 A/B、冻结历史因子，再重建 optimizer。
-- 历史文本特征每任务缓存；vision-only 缓存当前文本；text/all 每步重新编码当前文本。
-- 标签加历史类别数，旧类别 image logits 设为 -inf。
-- image CE 与上游相同的 text multi-hot 软目标 CE；vision/all 使用两项之和，text-only 使用 image CE。
-- logit_scale 仅取一次指数；不引入 LADA 的训练损失、原型采样和调度器。
-
-prec=fp32 与原 MoRAM 无 autocast 的训练保持一致；本实现拒绝其他训练精度。默认单进程选择一个 device，没有额外加入多 GPU 调度。多任务时要求 ls=0，避免 label smoothing 与旧类 -inf 屏蔽组合产生无限损失。
-
-## Checkpoint 与评估
-
-与 LADA 相同：通过 `model_dir/checkpoint.pth.tar` 读取前任务结果；main 未指定 model_dir 时使用当前 output_dir。模型与历史 LoRA、已完成任务、历史 prompts、配置一同保存。任务顺序和 LoRA 配置需一致；检查任务索引，防止误跳过历史训练。
-
-checkpoint 仅支持任务边界恢复。可选 resume 字段用于显式指定 checkpoint 文件，但标准脚本不需要它。只加载可信本地 checkpoint。
-
-评估严格保留 LADA 的 test_cur_task / test_zero_shot / test_wo_selector / test_w_selector 结构。不带 selector 时，已见类别使用每任务结束缓存的训练模型文本特征，未见类别使用冻结 CLIP 文本特征（与 LADA 相同），不再将全部类别用当前模型重新编码。输出 `* Task i Accuracy: ...%`，由 LADA result_process.py 解析。非当前任务内的局部候选类别评估。
+恢复先读取相同的原始 CLIP 权重，再加载 MoRAM。保持同样任务顺序、backbone、目标层和超参；rank 检查只能校验历史数量，不能辨认相同长度但不同顺序的任务。后续任务通过 model_dir/checkpoint.pth.tar 加载，之后递增一次并重建 optimizer。加载保持设备/dtype，历史参数冻结。只支持任务边界衔接，不支持迭代中途恢复。
 
 ## 验证
 
@@ -87,82 +90,6 @@ cd myMoRAM
 PYTHONDONTWRITEBYTECODE=1 /workspace/moram-venv/bin/python -m unittest discover -s tests -v
 ```
 
-4 项 CPU 集成测试通过：实际参数配置与 LADA 入口约定、三种编码器模式的真实更新、两任务独立启动/自动 checkpoint 衔接/再次恢复/zero-shot，以及 MoRAM optimizer、cosine schedule 和上传损失公式；同时执行当前任务、zero-shot、带/不带 selector 评估。测试使用小型随机 CLIP、内存 PIL 图片及真实 LADA DataLoader/增强流程。
+5 项 CPU 测试通过：三种编码器训练更新、两任务 LoRA-only 衔接及各评估路径、optimizer/schedule/loss 数值、非零历史/当前 LoRA 保存恢复与 rank/dtype/冻结、实际实验配置和 LADA 入口兼容。Checkpoint 测试验证其只有两个 MoRAM 字段。
 
-未验证正式权重、真实 X-TAIL、GPU 或论文精度；不能据此判断实际 zero-shot gap 已消除。
-
-来源：LADA `c74806cd8ebe50f51dc6b448d3abe404ff4b41cb`；MoRAM `aaa51d8ec67171e1bc5e1a1168351588561256c4`，以及用户上传训练逻辑。
-
-
-## trainer.py 与 LADA 原版的必要差异
-
-Trainer 的方法集合与 LADA 原版完全相同，没有另建 current_loader/train_task/evaluate 等训练控制接口。
-
-- `__init__`：保持设备、数据/模型构建、Evaluator 初始化顺序；补 MoRAM 历史状态与配方检查。
-- `build_data_loader`、`test_zero_shot`：与 LADA 原版方法完全一致。
-- `load_clip_to_cpu`：仍按 LADA 构建；增加本地 checkpoint 路径并修复普通 state_dict 上错误调用 eval 的问题。
-- `build_model`：PeftModelFromCLIP 替换成 MoRAM_CLIP；历史 A/B 恢复/递增替代 DPT/LADA 构建。
-- `build_optimizer` / `build_criterion` / `train`：只改 MoRAM 必需的参数组、AdamW、cosine、固定迭代数和双向损失；保留 LADA 的 epoch/batch 骨架、AverageMeter、ETA、训练后保存及评估顺序。epoch 数根据 iteration cap 推导，不使用 cfg.num_epochs 改写 MoRAM 的总步数。
-- 其余三个测试方法：保留 LADA 流程，只移除 text_tuner、lada_features、classifier 等已不存在的参数，文本原型改为 Trainer 缓存。
-- `save_model` / `load_model4CL`：同名、同 checkpoint 路径，内容替换为 MoRAM 模型/历史因子与文本缓存。不兼容上一版开发中的 checkpoint 格式，需重新开始实验。
-
-重新使用原 LADA `utils/evaluator.py`；只给 task selection precision 的零分母增加保护，未改变有预测样本时的计算。checkpoint 保持任务边界恢复，不额外承诺恢复随机状态或迭代中间恢复。
-
-## Zero-shot 类别原型缓存
-
-`Trainer.load_or_extract_zero_shot_prototypes(directory, force=False)` 在构建训练模型时自动调用。它使用**未注入 LoRA 的原始 CLIP**，从 `train_loader4updating` 提取特征（训练 split、确定性 test transform，不读取测试集图像作为训练原型）。
-
-默认缓存文件：`output/<run>/zero_shot_prototypes/<dataset>.pth`。可设置 `zero_shot_prototype_dir /path/to/cache` 来跨实验共享，实际文件位于该目录的 `zero_shot_prototypes/` 下。
-
-每类图像先做单位归一化，再按类别求均值，最后再归一化，得到 `[num_classes, embedding_dim]` 的视觉原型。缓存内容为：
-
-- `image_prototypes`：上述 frozen zero-shot 视觉原型。
-- `text_prototypes`：冻结 CLIP 使用统一类别模板的单位文本原型。
-- `counts`：每类样本数量。
-- `metadata`：类别排列、样本来源、权重摘要、分辨率等，用于检查缓存是否匹配。
-
-每次先读缓存，匹配则不再跑视觉编码；不匹配时重新提取。需要手动重提取可调用：
-
-```python
-trainer.load_or_extract_zero_shot_prototypes(cfg.output_dir, force=True)
-```
-
-提取会恢复 CPU 随机状态，避免“命中缓存/重新提取”改变后续训练的 shuffle 随机序列。视觉原型来自 few-shot 设置选中的训练样本，不是 GMM 中心；不生成无意义的 covariance、lada_features 或 classifier。
-
-`save_model/load_model4CL` 同步保存/恢复累计的 `image_prototypes`、`zero_shot_text_prototypes`、`prototype_counts`，顺序与已完成任务及其 classnames 一致。checkpoint 的 `text_prototypes` 仍为 LADA 评估流程使用的**训练后文本缓存**，与冻结参考文本原型分开。
-
-这些 zero-shot 原型仅作为对照保存，不参与 MoRAM replay 或损失；模型 checkpoint 仍需保存实际 LoRA 和历史因子，保证持续学习。没有这些原型字段的旧开发 checkpoint 需要从第一任务重新开始。
-
-现有 5 项 CPU 测试通过，新增验证缓存命中不做图像编码、手工均值结果一致、强制重算、元数据变化失效、随机状态恢复，以及两任务原型累计与 checkpoint 加载。
-
-## MoRAM utilities 与 LoRA-only checkpoint
-
-已将上游 `XTAIL/utils.py` 导入为 `utils/moram_utils.py`，避免根目录 `utils.py` 与 LADA `utils/` 包同名冲突。
-
-- `assign_learning_rate`、`_warmup_lr`、`cosine_lr` 与上游实现完全一致，Trainer 直接使用此处的 cosine_lr。
-- `utils/scheduler.py` 只是兼容 re-export，不再有第二份调度器实现。
-- `torch_save_lora` / `torch_load_lora` 负责 MoRAM factors 与 rank 的持久化，Trainer 的 save_model/load_model4CL 已接入。
-
-`checkpoint.pth.tar` 结构现在是：
-
-```python
-{
-    'state_dict': ...,    # 仅 LoRA A/B、历史 A/B、gate 等；无 CLIP backbone 权重
-    'lora_ranks': ...,    # 每层 rank / old_rank / init_rank / lora_scaling
-    'text_prototypes': ...,
-    'image_prototypes': ...,
-    'zero_shot_text_prototypes': ...,
-    'prototype_counts': ...,
-    'seen_prompts': ...,
-    'completed_tasks': ...,
-    'config': ...,
-}
-```
-
-这替换了早期开发版本的完整 `model` state。恢复时先正常加载同一份原始 CLIP，然后依据保存的 rank 重建 A/B、严格检查 LoRA 张量并加载；不再靠重复 increment_task 猜历史形状。随后按 LADA 流程为下一个任务递增一次，并重建 optimizer。
-
-相比原版工具函数，只补齐必要兼容：weights_only 安全读取、按目标层的 device/dtype 分配 Parameter、历史因子冻结、gate buffer 恢复，以及 lora_scaling/init_rank 保存。工具函数在重建 Parameter 后要求重新创建 optimizer。纯工具调用仍保持原签名；save 函数额外支持可选 extra_state，以便原型和任务元数据一次写入同一个 checkpoint。
-
-旧版完整模型 checkpoint 不能直接加载新格式，需重训或单独迁移。恢复必须使用相同 backbone 权重及模型配置，LoRA-only checkpoint 不包含原始 CLIP 权重。
-
-当前 6 项 CPU 测试通过，新增验证非零历史/当前 LoRA 的保存恢复结果逐元素相同、rank 与 dtype、历史冻结、损坏参数检测，以及 checkpoint 中确实没有 backbone weight/bias。正式 GPU 测试尚未运行。
+测试用随机小型 CLIP、内存 PIL 图像和真实 LADA 数据加载流程。正式权重、真实 X-TAIL、GPU 和最终准确率尚未验证。
