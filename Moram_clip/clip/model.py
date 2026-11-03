@@ -184,7 +184,13 @@ class ResidualAttentionBlock(nn.Module):
 
     def forward(self, x: torch.Tensor):
         x = x + self.attention(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        x_mlp = self.ln_2(x)
+        for layer in self.mlp:
+            x_mlp = layer(x_mlp)
+            # MoRAM_Linear returns (features, loss); ordinary layers return tensors.
+            if isinstance(x_mlp, tuple):
+                x_mlp, _ = x_mlp
+        x = x + x_mlp
         return x
 
 

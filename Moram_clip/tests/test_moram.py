@@ -7,7 +7,7 @@ import unittest
 import torch
 from Moram_clip import apply_lora, get_moram, increment_task
 from Moram_clip.clip.model import CLIP
-from Moram_clip.models import MoRAMLinearTensor, PlainMultiheadAttentionLoRA
+from Moram_clip.models import PlainMultiheadAttentionLoRA
 from Moram_clip.models import MoRAM_Linear
 
 
@@ -20,10 +20,10 @@ class MoRAMCLIPTests(unittest.TestCase):
         self.cfg=dict(rank=4,topk=2,temp=0.1,prune_thre=0,target_encoder='all',
                       target_modules=['q_proj','k_proj','v_proj','out_proj','ffn_in','ffn_out'])
 
-    def test_original_lada_files_unchanged(self):
+    def test_lada_files_only_change_ffn_tuple_handling(self):
         root=Path(__file__).resolve().parents[2]
         for original in (root/'clip').iterdir():
-            if original.is_file():
+            if original.is_file() and original.name != 'model.py':
                 self.assertEqual(original.read_bytes(),(root/'Moram_clip/clip'/original.name).read_bytes())
 
     def test_zero_delta_preserves_features_logits_and_causal_mask(self):
@@ -58,6 +58,9 @@ class MoRAMCLIPTests(unittest.TestCase):
             model=apply_lora(copy.deepcopy(self.base),dict(self.cfg,target_encoder=target,target_modules=['ffn_in']))
             names=[n for n,p in model.named_parameters() if p.requires_grad]
             self.assertTrue(names)
+            transformer = model.visual.transformer if target == 'vision' else model.transformer
+            self.assertIs(type(transformer.resblocks[0].mlp.c_fc), MoRAM_Linear)
+            self.assertIsInstance(transformer.resblocks[0].mlp.c_fc(torch.randn(2,64)), tuple)
             if target=='vision': self.assertTrue(all(n.startswith('visual.') for n in names))
             if target=='text': self.assertTrue(all(not n.startswith('visual.') for n in names))
             with self.assertRaises(ValueError): apply_lora(model,self.cfg)
@@ -123,5 +126,14 @@ class MoRAMCLIPTests(unittest.TestCase):
         logits.square().mean().backward()
         self.assertTrue(any(p.grad is not None for n,p in model.named_parameters() if n.endswith('.lora_B')))
         self.assertTrue(all(p.grad is None for p in frozen.parameters()))
+
+    def test_plain_ffn_matches_original_lada(self):
+        root=Path(__file__).resolve().parents[2]
+        spec=importlib.util.spec_from_file_location('original_lada_model',root/'clip/model.py')
+        original=importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(original)
+        reference=original.CLIP(16,8,2,64,4,7,32,64,1,2).float().eval()
+        reference.load_state_dict(self.base.state_dict())
+        torch.testing.assert_close(self.base(self.image,self.text)[0],reference(self.image,self.text)[0],rtol=0,atol=0)
 
 if __name__=='__main__': unittest.main()

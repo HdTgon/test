@@ -6,9 +6,9 @@
 
 - `ZeroShotCLIP(clip_model: CLIP)`：冻结参考。保留类别名下划线替换、逐模板归一化、模板均值再归一化及图文相似度分类流程。文本编码直接调用原始 LADA CLIP，不依赖 Peft_Text / Text_Tuner。
 - `MoRAM_CLIP(cfg, clip_model: CLIP)`：替代 PeftModelFromCLIP；只注入 MoRAM LoRA，没有 DPT、LADA 分类分支或 Text_Tuner。
-- 同一文件包含 `MoRAM_Linear`、`PlainMultiheadAttentionLoRA`、FFN 张量适配、`apply_lora(model, cfg)`、冻结参数和任务递增逻辑。没有重复定义 CLIP、ViT 或 Transformer。
+- 同一文件包含 `MoRAM_Linear`、`PlainMultiheadAttentionLoRA`、`apply_lora(model, cfg)`、冻结参数和任务递增逻辑。没有重复定义 CLIP、ViT 或 Transformer。
 - 两个封装都复制传入 backbone，不改动调用方的 clip_model。`image_encoder` 是内部原始 visual；`clip_model` 是内部 backbone，包含全部文本编码参数。
-- `clip/` 仍为 LADA 原始实现，未改动。
+- `clip/` 使用 LADA 实现，仅在 ResidualAttentionBlock.forward 中逐层执行 FFN，解包 MoRAM_Linear 的 `(features, loss)`。未注入时计算结果与原版逐元素一致。
 
 ## 已有 clip_model
 
@@ -74,7 +74,7 @@ optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad]
 LADA `c74806cd8ebe50f51dc6b448d3abe404ff4b41cb`：原始 clip/ 与 ZeroShotCLIP 分类流程。
 MoRAM `aaa51d8ec67171e1bc5e1a1168351588561256c4`：路由 LoRA 和 Q/K/V/out、FFN 注入。
 
-仅修复设备/精度、attention 返回布局、rank=0/top-k 边界、CPU 任务递增；FFN 适配丢弃上游恒为 0 的正则 loss，确保原始 Sequential 仍返回张量。原始路由算法保留。attention 只覆盖 LADA 三维自注意力，不是通用 MultiheadAttention 替代品。
+仅修复设备/精度、attention 返回布局、rank=0/top-k 边界、CPU 任务递增；FFN 直接注入原始 MoRAM_Linear，在残差块中解包其返回值，不再使用额外的线性层子类。当前上游正则 loss 恒为 0，在这里丢弃。原始路由算法保留。attention 只覆盖 LADA 三维自注意力，不是通用 MultiheadAttention 替代品。
 
 ## 验证与限制
 
@@ -83,6 +83,6 @@ cd /workspace/test
 /workspace/moram-venv/bin/python -m unittest discover -s Moram_clip/tests -v
 ```
 
-8 项 CPU 小型随机模型测试通过，包括原始文件不变、初始 LoRA 输出一致、梯度/更新隔离、目标选择、任务递增、加载与封装、多模板分类及文本 LoRA 训练。正式预训练权重、GPU、数据集准确率未验证。旧版本 checkpoint 的包装参数路径改变，不能假定整模型 checkpoint 直接兼容。
+9 项 CPU 小型随机模型测试通过，包括普通 FFN 与原版逐元素一致、直接注入 MoRAM_Linear 及 tuple 接口、初始 LoRA 输出一致、梯度/更新隔离、目标选择、任务递增、加载与封装、多模板分类及文本 LoRA 训练。正式预训练权重、GPU、数据集准确率未验证。旧版本 checkpoint 的包装参数路径改变，不能假定整模型 checkpoint 直接兼容。
 
 依赖：torch、torchvision、numpy、Pillow、ftfy、regex、tqdm。无需外部 loralib 或 open_clip。

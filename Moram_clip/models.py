@@ -403,15 +403,6 @@ class PlainMultiheadAttentionLoRA(nn.Module):
         return super().train(mode)
 
 
-class MoRAMLinearTensor(MoRAM_Linear):
-    """Let LADA's original nn.Sequential MLP receive a tensor, not a tuple.
-
-    The active upstream MoRAM implementation always returns regularization 0.
-    """
-    def forward(self, x):
-        return super().forward(x)[0]
-
-
 def mark_only_moram_trainable(model):
     for name, param in model.named_parameters():
         param.requires_grad_(name.endswith(('.lora_A', '.lora_B')))
@@ -453,21 +444,35 @@ def apply_lora(model, cfg):
                 block.attn = PlainMultiheadAttentionLoRA(
                     block.attn, module_name=name+'.attn', enable_lora=enabled,
                     r=rank, lora_temp=temp, lora_threshold=threshold, lora_topk=topk)
-            for key, attr in [('ffn_in','c_fc'), ('ffn_out','c_proj')]:
-                if key not in targets:
-                    continue
-                original = getattr(block.mlp, attr)
-                layer = MoRAMLinearTensor(original.in_features, original.out_features,
-                    bias=original.bias is not None, r=rank, merge_weights=False,
-                    module_name=name+'.mlp.'+attr, temp=temp,
-                    lora_threshold=threshold, topk=topk,
-                    device=original.weight.device, dtype=original.weight.dtype)
-                with torch.no_grad():
-                    layer.weight.copy_(original.weight)
-                    if original.bias is not None:
-                        layer.bias.copy_(original.bias)
-                layer.train(original.training)
-                setattr(block.mlp, attr, layer)
+            ffn_target_modules = []
+            if 'ffn_in' in targets:
+                ffn_target_modules.append('c_fc')
+            if 'ffn_out' in targets:
+                ffn_target_modules.append('c_proj')
+            submodule = block.mlp
+            full_name = name + '.mlp'
+            for ffn_name, ffn_submodule in submodule.named_children():
+                ffn_full_name = f"{full_name}.{ffn_name}"
+                if ffn_name in ffn_target_modules and isinstance(ffn_submodule, nn.Linear):
+                    lora_layer = MoRAM_Linear(
+                        ffn_submodule.in_features,
+                        ffn_submodule.out_features,
+                        r=rank,
+                        bias=ffn_submodule.bias is not None,
+                        merge_weights=False,
+                        module_name=ffn_full_name,
+                        temp=temp,
+                        lora_threshold=threshold,
+                        topk=topk,
+                        device=ffn_submodule.weight.device,
+                        dtype=ffn_submodule.weight.dtype,
+                    )
+                    with torch.no_grad():
+                        lora_layer.weight.copy_(ffn_submodule.weight)
+                        if ffn_submodule.bias is not None:
+                            lora_layer.bias.copy_(ffn_submodule.bias)
+                    lora_layer.train(ffn_submodule.training)
+                    setattr(submodule, ffn_name, lora_layer)
             block.attn.train(block.training)
     return mark_only_moram_trainable(model)
 
