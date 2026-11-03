@@ -45,15 +45,15 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(trainer.completed_tasks,1)
         for n,p in trainer.model.named_parameters():
             if n in initial: torch.testing.assert_close(p,initial[n],rtol=0,atol=0)
-        checkpoint=str(Path(self.tmp.name)/'aircraft.pth')
-        resume=self.cfg.clone();resume.resume=checkpoint
+        checkpoint=str(Path(self.tmp.name)/'checkpoint.pth.tar')
+        resume=self.cfg.clone();resume.dataset='caltech101';resume.model_dir=self.tmp.name;resume.continue_train=True
         resumed=Trainer(resume)
         self.assertEqual(resumed.completed_tasks,1)
         for n,p in trainer.model.state_dict().items(): torch.testing.assert_close(p,resumed.model.state_dict()[n],rtol=0,atol=0)
         resumed.train()
         self.assertEqual(resumed.completed_tasks,2)
         self.assertEqual(len(resumed.seen_prompts),4)
-        final=self.cfg.clone();final.resume=str(Path(self.tmp.name)/'caltech101.pth')
+        final=self.cfg.clone();final.resume=str(Path(self.tmp.name)/'checkpoint.pth.tar')
         restored=Trainer(final)
         for n,p in resumed.model.state_dict().items(): torch.testing.assert_close(p,restored.model.state_dict()[n],rtol=0,atol=0)
         self.assertEqual(len(restored.evaluate()),2)
@@ -93,4 +93,22 @@ class WorkflowTests(unittest.TestCase):
         torch.testing.assert_close(loss,expected,atol=0,rtol=0)
         self.assertTrue(torch.isfinite(loss))
 
-if __name__=='__main__':unittest.main()
+class LADACompatibilityTests(unittest.TestCase):
+    def test_entry_and_experiment_config(self):
+        import ast
+        root=Path(__file__).resolve().parents[1]
+        tree=ast.parse((root/'main.py').read_text())
+        main=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='main')
+        source=ast.unparse(main)
+        for text in ['cfg.model_dir = cfg.output_dir', 'setup_logger(cfg.output_dir, cfg.dataset)', 'trainer.train()']:
+            self.assertIn(text,source)
+        cfg=_C.clone();cfg.merge_from_file(str(root/'configs/data/TAIL.yaml'));cfg.merge_from_file(str(root/'configs/model/moram_vit_b16.yaml'))
+        self.assertEqual((cfg.rank,cfg.topk,cfg.iterations,cfg.lr,cfg.prune_thre),(16,16,500,5e-4,0.2))
+        self.assertEqual(cfg.batch_size,64)
+        self.assertEqual(set(cfg.target_modules),{'q_proj','k_proj','v_proj','out_proj','ffn_in','ffn_out'})
+        from result_process import extract_task_accuracies
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'log_aircraft.txt';path.write_text('* Task 0 Accuracy: 25.0%\n* Task 1 Accuracy: 50.0%\n')
+            self.assertEqual(extract_task_accuracies(path,2),[25.,50.])
+
+if __name__=='__main__' :unittest.main()

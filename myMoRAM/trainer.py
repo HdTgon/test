@@ -55,9 +55,11 @@ class Trainer:
         self.completed_tasks=0
         self.accuracy_table=[]
         self.build_data_loader()
-        if cfg.resume:
-            if cfg.zero_shot: raise ValueError('resume is for MoRAM training/evaluation, not frozen zero-shot')
-            self.load_checkpoint(cfg.resume)
+        if not cfg.zero_shot:
+            if cfg.resume:
+                self.load_checkpoint(cfg.resume)
+            elif cfg.continue_train and not cfg.continue_train_first:
+                self.load_model4CL(cfg.model_dir or cfg.output_dir)
 
     def build_data_loader(self):
         from scenario_datasets.build_functions import build_TAIL_testloader
@@ -124,24 +126,28 @@ class Trainer:
         return losses
 
     def train(self):
+        # LADA workflow: one configured dataset per process; scripts set task order.
         cfg=self.cfg
-        for i,task in enumerate(cfg.dataset_sequence):
-            if i<self.completed_tasks: continue
-            if cfg.dataset and cfg.dataset!=task:
-                raise ValueError('For a later dataset resume the preceding task checkpoint; otherwise leave dataset empty for the full sequence')
-            loader,names=self.current_loader(task)
-            expected=self.merged_classnames[self.indices[i]:self.indices[i]+len(names)]
-            if list(names)!=list(expected): raise ValueError(f'Train/eval class order differs for {task}')
-            if i: increment_task(self.model)
-            self.train_task(loader,names,task)
-            self.seen_prompts.extend(self.prompts(names))
-            self.completed_tasks=i+1
-            self.accuracy_table.append(self.evaluate())
-            os.makedirs(cfg.output_dir,exist_ok=True)
-            np.savetxt(os.path.join(cfg.output_dir,'accuracies.csv'),np.asarray(self.accuracy_table),
-                       delimiter=',',header=','.join(cfg.dataset_sequence),comments='',fmt='%.6f')
-            self.save_checkpoint(os.path.join(cfg.output_dir,f'{task}.pth'))
-            if cfg.dataset: break
+        if cfg.dataset not in cfg.dataset_sequence:
+            raise ValueError('Set dataset to the task to train, as in the LADA scripts')
+        i=cfg.dataset_sequence.index(cfg.dataset)
+        if i!=self.completed_tasks:
+            raise ValueError(f'Task {cfg.dataset} expects {i} completed tasks, checkpoint has {self.completed_tasks}; check continue_train_first/model_dir')
+        loader,names=self.current_loader(cfg.dataset)
+        expected=self.merged_classnames[self.indices[i]:self.indices[i]+len(names)]
+        if list(names)!=list(expected): raise ValueError(f'Train/eval class order differs for {cfg.dataset}')
+        if i: increment_task(self.model)
+        self.train_task(loader,names,cfg.dataset)
+        self.seen_prompts.extend(self.prompts(names))
+        self.completed_tasks=i+1
+        self.accuracy_table.append(self.evaluate())
+        os.makedirs(cfg.output_dir,exist_ok=True)
+        np.savetxt(os.path.join(cfg.output_dir,'accuracies.csv'),np.asarray(self.accuracy_table),
+                   delimiter=',',header=','.join(cfg.dataset_sequence),comments='',fmt='%.6f')
+        self.save_checkpoint(os.path.join(cfg.output_dir,'checkpoint.pth.tar'))
+
+    def load_model4CL(self,directory):
+        self.load_checkpoint(os.path.join(directory,'checkpoint.pth.tar'))
 
     @torch.no_grad()
     def evaluate(self):
@@ -159,8 +165,9 @@ class Trainer:
                 total[i]+=int(mask.sum());correct[i]+=int((pred[mask]==labels[mask]).sum())
         if any(n==0 for n in total): raise ValueError('An evaluation task has no samples')
         accuracies=[100*c/n for c,n in zip(correct,total)]
-        print('Task accuracies:',dict(zip(self.cfg.dataset_sequence,accuracies)))
-        print(f'Average Accuracy: {np.mean(accuracies):.2f}%')
+        for i,acc in enumerate(accuracies):
+            print(f'* Task {i} Accuracy: {acc:.1f}%')
+        print(f'* Average Accuracy: {np.mean(accuracies):.1f}%')
         return accuracies
 
     def test_zero_shot(self):
