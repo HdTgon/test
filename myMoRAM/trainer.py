@@ -1,20 +1,25 @@
-"""LADA data workflow with the uploaded MoRAM iteration-based training recipe."""
 import os
-import random
-import numpy as np
+import time
+import datetime
+import math
+from tqdm import tqdm
+
 import torch
+import torch.nn as nn
 from torch.nn import functional as F
 from torchvision import transforms
-from clip import clip
-from models.models import ZeroShotCLIP, MoRAM_CLIP, increment_task
-from utils.scheduler import cosine_lr
 
+from clip import clip
+from scenario_datasets.build_functions import build_cur_task_data_loader, build_TAIL_testloader
+from models.models import ZeroShotCLIP, MoRAM_CLIP, increment_task
+from utils.meter import AverageMeter
+from utils.evaluator import Evaluator
+from utils.scheduler import cosine_lr
 
 def build_optimizer(cfg, model):
     # Exact upstream MoRAM optimizer, including beta2=0.9999 (not LADA's default).
     return torch.optim.AdamW(model.parameters(), lr=cfg.lr,
                              weight_decay=cfg.wd, betas=(0.9, 0.9999))
-
 
 def moram_losses(image_features, embeddings, scale, labels, seen_count, target_encoder, smoothing):
     logits = scale * image_features @ embeddings.t()
@@ -27,169 +32,421 @@ def moram_losses(image_features, embeddings, scale, labels, seen_count, target_e
     loss = ce_i + ce_t if target_encoder in ('vision', 'all') else ce_i
     return loss, ce_i, ce_t, logits
 
+def load_clip_to_cpu(backbone_name, prec, checkpoint_path=""):
+    backbone_name = backbone_name.removeprefix("CLIP-")
+    if checkpoint_path:
+        model_path = checkpoint_path
+    else:
+        url = clip._MODELS[backbone_name]
+        model_path = clip._download(url)
+    try:
+        model = torch.jit.load(model_path, map_location="cpu").eval()
+        state_dict = None
+    except RuntimeError:
+        state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
+    model = clip.build_model(state_dict or model.state_dict())
+    assert prec in ["fp16", "fp32", "amp"]
+    if prec == "fp32" or prec == "amp":
+        model.float()
+    return model
+
 
 class Trainer:
     def __init__(self, cfg):
-        self.cfg=cfg
-        if cfg.device=='auto':
-            self.device=torch.device(f'cuda:{cfg.gpu}' if cfg.gpu is not None else 'cuda') if torch.cuda.is_available() else torch.device('cpu')
-        else: self.device=torch.device(cfg.device)
-        if cfg.prec!='fp32':
-            raise ValueError('Use prec=fp32: upstream MoRAM training has no autocast/scaler; mixed precision is not silently enabled')
-        if cfg.print_freq<=0:
+
+        if not torch.cuda.is_available():
+            self.device = torch.device("cpu")
+        elif cfg.gpu is None:
+            self.device = torch.device("cuda")
+        else:
+            torch.cuda.set_device(cfg.gpu)
+            self.device = torch.device("cuda:{}".format(cfg.gpu))
+
+        if cfg.prec != 'fp32':
+            raise ValueError('MoRAM recipe requires prec=fp32')
+        if cfg.iterations <= 0 or not 0 <= cfg.warmup_length <= cfg.iterations:
+            raise ValueError('Invalid iterations/warmup_length')
+        if cfg.print_freq <= 0:
             raise ValueError('print_freq must be positive')
-        if cfg.iterations<=0 or cfg.warmup_length<0 or cfg.warmup_length>cfg.iterations:
-            raise ValueError('Require iterations>0 and 0<=warmup_length<=iterations')
-        if cfg.ls and len(cfg.dataset_sequence)>1:
-            raise ValueError('Upstream masks old logits to -inf: nonzero label smoothing makes later-task loss infinite; use ls=0')
-        if not cfg.dataset_sequence or len(set(cfg.dataset_sequence))!=len(cfg.dataset_sequence):
-            raise ValueError('dataset_sequence must be nonempty and contain no duplicate tasks')
-        backbone=cfg.backbone.removeprefix('CLIP-')
-        backbone={'ViT-B-16':'ViT-B/16','ViT-B-32':'ViT-B/32'}.get(backbone,backbone)
-        base,_=clip.load(cfg.checkpoint_path or backbone,device='cpu',jit=False)
-        base.float()
-        self.model=(ZeroShotCLIP(base) if cfg.zero_shot else MoRAM_CLIP(dict(cfg),base)).to(self.device).eval()
-        del base
-        self.tokenizer=clip.tokenize
-        self.seen_prompts=[]
-        self.completed_tasks=0
-        self.accuracy_table=[]
+        if cfg.ls and len(cfg.dataset_sequence) > 1:
+            raise ValueError('Use ls=0 with old-class -inf masking')
+        self.cfg = cfg
+        self.seen_prompts = []
+        self.completed_tasks = 0
+        self.text_prototypes = None
         self.build_data_loader()
-        if not cfg.zero_shot:
-            if cfg.resume:
-                self.load_checkpoint(cfg.resume)
-            elif cfg.continue_train and not cfg.continue_train_first:
-                self.load_model4CL(cfg.model_dir or cfg.output_dir)
+        self.build_model()
+        self.evaluator = Evaluator(cfg)
 
     def build_data_loader(self):
-        from scenario_datasets.build_functions import build_TAIL_testloader
-        cfg=self.cfg
-        mean=(0.48145466,0.4578275,0.40821073);std=(0.26862954,0.26130258,0.27577711)
-        self.transform_test=transforms.Compose([
-            transforms.Resize(cfg.resolution,interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.CenterCrop(cfg.resolution),transforms.Lambda(lambda im:im.convert('RGB')),
-            transforms.ToTensor(),transforms.Normalize(mean,std)])
-        self.test_loader,self.merged_classnames,self.indices=build_TAIL_testloader(
-            cfg.root,cfg.dataset_sequence,self.transform_test,cfg.batch_size,cfg.num_workers)
+        cfg = self.cfg
+        root = cfg.root
+        resolution = cfg.resolution
 
-    def current_loader(self, task):
-        from scenario_datasets.build_functions import build_cur_task_data_loader
-        cfg=self.cfg
-        if task in ('mnist','eurosat'):
-            transform=self.transform_test
+        mean = (0.48145466, 0.4578275, 0.40821073)
+        std = (0.26862954, 0.26130258, 0.27577711)
+        print("mean:", mean)
+        print("std:", std)
+
+        if cfg.dataset in ["mnist", "eurosat"]:
+            self.transform_train = transforms.Compose([
+                transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BICUBIC),
+                transforms.CenterCrop(resolution),
+                transforms.Lambda(lambda image: image.convert("RGB")),
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std),
+            ])
         else:
-            transform=transforms.Compose([
-                transforms.RandomResizedCrop(cfg.resolution,interpolation=transforms.InterpolationMode.BICUBIC),
-                transforms.RandomHorizontalFlip(),transforms.Lambda(lambda im:im.convert('RGB')),
-                transforms.ToTensor(),transforms.Normalize((0.48145466,0.4578275,0.40821073),(0.26862954,0.26130258,0.27577711))])
-        train,_,_,names=build_cur_task_data_loader(cfg.root,task,transform,self.transform_test,cfg.num_shots,cfg.batch_size,cfg.num_workers)
-        return train,names
+            self.transform_train = transforms.Compose([
+                transforms.RandomResizedCrop(resolution, interpolation=transforms.InterpolationMode.BICUBIC),
+                transforms.RandomHorizontalFlip(),
+                transforms.Lambda(lambda image: image.convert("RGB")),
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std),
+            ])
 
-    def prompts(self, names):
-        return [self.cfg.template.format(name.replace('_',' ')) for name in names]
+        self.transform_test = transforms.Compose([
+            transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(resolution),
+            transforms.Lambda(lambda image: image.convert("RGB")),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
 
-    def train_task(self, loader, names, task):
-        cfg=self.cfg
-        if len(loader)==0: raise ValueError(f'Empty training loader: {task}')
-        optimizer=build_optimizer(cfg,self.model)
-        scheduler=cosine_lr(optimizer,cfg.lr,cfg.warmup_length,cfg.iterations)
-        tokens=self.tokenizer(self.prompts(names)).to(self.device)
-        seen_count=len(self.seen_prompts)
-        self.model.eval()
-        with torch.no_grad():
-            seen=F.normalize(self.model.encode_text(self.tokenizer(self.seen_prompts).to(self.device)),dim=-1) if seen_count else None
-            current=F.normalize(self.model.encode_text(tokens),dim=-1) if cfg.target_encoder=='vision' else None
-        iterator=iter(loader)
-        losses=[]
-        print(f'Task {task}: iterations={cfg.iterations}, trainable={sum(p.numel() for p in self.model.parameters() if p.requires_grad)}')
-        for iteration in range(cfg.iterations):
-            self.model.train()
-            scheduler(iteration)
-            try: images,labels=next(iterator)
-            except StopIteration:
-                iterator=iter(loader);images,labels=next(iterator)
-            images=images.to(self.device);labels=labels.to(self.device)+seen_count
-            if cfg.target_encoder in ('text','all'):
-                current=F.normalize(self.model.encode_text(tokens),dim=-1)
-            embeddings=torch.cat([seen,current],dim=0) if seen is not None else current
-            output=F.normalize(self.model.encode_image(images),dim=-1)
-            # Wrapper scale is already exp; do not exponentiate it twice.
-            loss,ce_i,ce_t,logits=moram_losses(output,embeddings,self.model.logit_scale,labels,seen_count,cfg.target_encoder,cfg.ls)
-            if not torch.isfinite(loss): raise FloatingPointError(f'Nonfinite loss in {task} iteration {iteration}')
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            losses.append(float(loss.detach()))
-            if iteration%cfg.print_freq==0 or iteration==cfg.iterations-1:
-                accuracy=100*logits.argmax(-1).eq(labels).float().mean().item()
-                print(f'{task} step {iteration+1}/{cfg.iterations} loss={loss.item():.6f} CE_i={ce_i.item():.6f} CE_t={ce_t.item():.6f} lr={optimizer.param_groups[0]["lr"]:.8f} acc={accuracy:.2f}')
-        return losses
+        build_TAIL_testloader_return = build_TAIL_testloader(root=root, 
+                                                             dataset_sequence=cfg.dataset_sequence, 
+                                                             transform_test=self.transform_test,
+                                                             batch_size=cfg.batch_size,
+                                                             num_workers=cfg.num_workers)
+        self.TAIL_test_loader, self.merged_classnames, self.indices = build_TAIL_testloader_return
+        
+        if not cfg.zero_shot:
+            build_cur_task_data_loader_return = build_cur_task_data_loader(root=root,
+                                                                        dataset_name=cfg.dataset, 
+                                                                        transform_train=self.transform_train, 
+                                                                        transform_test=self.transform_test, 
+                                                                        num_shots=cfg.num_shots, 
+                                                                        batch_size=cfg.batch_size,
+                                                                        num_workers=cfg.num_workers)
+            self.train_loader, self.train_loader4updating, self.test_loader, self.classnames = build_cur_task_data_loader_return
+
+            self.num_classes = len(self.classnames)
+
+    def build_model(self):
+        cfg = self.cfg
+        print("Building model")
+        print(f"Loading CLIP (backbone: {cfg.backbone})")
+        self.clip_model = load_clip_to_cpu(cfg.backbone, cfg.prec, cfg.checkpoint_path)
+        if cfg.zero_shot:
+            self.model = ZeroShotCLIP(self.clip_model).to(self.device)
+            self.model.init_text_features(self.merged_classnames, ['a photo of a {}.'], clip.tokenize, self.device)
+        else:
+            self.model = MoRAM_CLIP(cfg, self.clip_model).to(self.device)
+            if cfg.resume:
+                self.load_model4CL(os.path.dirname(cfg.resume), load_path=cfg.resume)
+            elif cfg.continue_train and not cfg.continue_train_first:
+                self.load_model4CL(cfg.model_dir)
+            task_index = cfg.dataset_sequence.index(cfg.dataset)
+            if task_index != self.completed_tasks:
+                raise ValueError('Task/checkpoint order differs; check continue_train_first and model_dir')
+            if self.completed_tasks:
+                increment_task(self.model)
+            self.total_num_classes = self.num_classes + len(self.seen_prompts)
+            self.model.init_prompts(self.classnames, ['a photo of a {}.'], clip.tokenize, self.device)
+            self.build_optimizer()
+            self.build_criterion()
+            torch.cuda.empty_cache()
+
+    def build_optimizer(self):
+        cfg = self.cfg
+        print(f"Total params: {sum(p.numel() for p in self.model.parameters())}")
+        print(f"Tuned MoRAM params: {sum(p.numel() for p in self.model.parameters() if p.requires_grad)}")
+        self.optim = build_optimizer(cfg, self.model)
+        self.sched = cosine_lr(self.optim, cfg.lr, cfg.warmup_length, cfg.iterations)
+
+    def build_criterion(self):
+        self.criterion = nn.CrossEntropyLoss(label_smoothing=self.cfg.ls)
 
     def train(self):
-        # LADA workflow: one configured dataset per process; scripts set task order.
-        cfg=self.cfg
-        if cfg.dataset not in cfg.dataset_sequence:
-            raise ValueError('Set dataset to the task to train, as in the LADA scripts')
-        i=cfg.dataset_sequence.index(cfg.dataset)
-        if i!=self.completed_tasks:
-            raise ValueError(f'Task {cfg.dataset} expects {i} completed tasks, checkpoint has {self.completed_tasks}; check continue_train_first/model_dir')
-        loader,names=self.current_loader(cfg.dataset)
-        expected=self.merged_classnames[self.indices[i]:self.indices[i]+len(names)]
-        if list(names)!=list(expected): raise ValueError(f'Train/eval class order differs for {cfg.dataset}')
-        if i: increment_task(self.model)
-        self.train_task(loader,names,cfg.dataset)
-        self.seen_prompts.extend(self.prompts(names))
-        self.completed_tasks=i+1
-        self.accuracy_table.append(self.evaluate())
-        os.makedirs(cfg.output_dir,exist_ok=True)
-        np.savetxt(os.path.join(cfg.output_dir,'accuracies.csv'),np.asarray(self.accuracy_table),
-                   delimiter=',',header=','.join(cfg.dataset_sequence),comments='',fmt='%.6f')
-        self.save_checkpoint(os.path.join(cfg.output_dir,'checkpoint.pth.tar'))
+        cfg = self.cfg
+        batch_time = AverageMeter()
+        data_time = AverageMeter()
+        loss_meter = AverageMeter(ema=True)
+        acc_meter = AverageMeter(ema=True)
+        time_start = time.time()
+        num_batches = len(self.train_loader)
+        if num_batches == 0:
+            raise ValueError('Empty training loader')
+        num_epochs = math.ceil(cfg.iterations / num_batches)
+        seen_count = len(self.seen_prompts)
+        self.model.eval()
+        with torch.no_grad():
+            seen_embeddings = F.normalize(self.model.encode_text(clip.tokenize(self.seen_prompts).to(self.device)), dim=-1) if seen_count else None
+            current_embeddings = F.normalize(self.model.encode_text(self.model.prompts), dim=-1) if cfg.target_encoder == 'vision' else None
 
-    def load_model4CL(self,directory):
-        self.load_checkpoint(os.path.join(directory,'checkpoint.pth.tar'))
+        for epoch_idx in range(num_epochs):
+            self.model.train()
+            end = time.time()
+            for batch_idx, batch in enumerate(self.train_loader):
+                iteration = epoch_idx * num_batches + batch_idx
+                if iteration >= cfg.iterations:
+                    break
+                data_time.update(time.time() - end)
+                image = batch[0].to(self.device)
+                label = batch[1].to(self.device) + seen_count
+                self.sched(iteration)
+                if cfg.target_encoder in ('text', 'all'):
+                    current_embeddings = F.normalize(self.model.encode_text(self.model.prompts), dim=-1)
+                embeddings = torch.cat((seen_embeddings, current_embeddings), dim=0) if seen_count else current_embeddings
+                image_features = F.normalize(self.model.encode_image(image), dim=-1)
+                loss, ce_i, ce_t, output = moram_losses(image_features, embeddings, self.model.logit_scale,
+                                                       label, seen_count, cfg.target_encoder, cfg.ls)
+                if not torch.isfinite(loss):
+                    raise FloatingPointError('Nonfinite MoRAM loss')
+                self.optim.zero_grad()
+                loss.backward()
+                self.optim.step()
+
+                with torch.no_grad():
+                    pred = output.argmax(dim=1)
+                    correct = pred.eq(label).float()
+                    acc = correct.mean().mul_(100.0)
+                current_lr = self.optim.param_groups[0]["lr"]
+                loss_meter.update(loss.item())
+                acc_meter.update(acc.item())
+                batch_time.update(time.time() - end)
+                meet_freq = (batch_idx + 1) % cfg.print_freq == 0
+                only_few_batches = num_batches < cfg.print_freq
+                if meet_freq or only_few_batches or iteration + 1 == cfg.iterations:
+                    nb_remain = cfg.iterations - iteration - 1
+                    eta = str(datetime.timedelta(seconds=int(batch_time.avg * nb_remain)))
+                    info = []
+                    info += [f"epoch [{epoch_idx + 1}/{num_epochs}]"]
+                    info += [f"batch [{batch_idx + 1}/{num_batches}]"]
+                    info += [f"iteration [{iteration + 1}/{cfg.iterations}]"]
+                    info += [f"time {batch_time.val:.3f} ({batch_time.avg:.3f})"]
+                    info += [f"data {data_time.val:.3f} ({data_time.avg:.3f})"]
+                    info += [f"loss {loss_meter.val:.4f} ({loss_meter.avg:.4f})"]
+                    info += [f"acc {acc_meter.val:.4f} ({acc_meter.avg:.4f})"]
+                    info += [f"lr {current_lr:.4e}"]
+                    info += [f"eta {eta}"]
+                    print(" ".join(info))
+                end = time.time()
+        torch.cuda.empty_cache()
+        print("Finish training")
+        elapsed = str(datetime.timedelta(seconds=round(time.time() - time_start)))
+        print(f"Time elapsed: {elapsed}")
+        self.model.eval()
+        with torch.no_grad():
+            features = self.model.encode_text(self.model.prompts)
+            self.text_prototypes = torch.cat((self.text_prototypes, features), dim=0) if self.text_prototypes is not None else features
+        self.seen_prompts += ['a photo of a {}.'.format(name.replace('_', ' ')) for name in self.classnames]
+        self.completed_tasks += 1
+        self.save_model(cfg.output_dir)
+        self.test_cur_task()
+        if cfg.continue_train:
+            self.test_wo_selector()
 
     @torch.no_grad()
-    def evaluate(self):
-        self.model.eval()
-        embeddings=F.normalize(self.model.encode_text(self.tokenizer(self.prompts(self.merged_classnames)).to(self.device)),dim=-1)
-        correct=[0]*len(self.indices);total=[0]*len(self.indices)
-        boundaries=torch.tensor(self.indices,device=self.device)
-        for images,labels in self.test_loader:
-            labels=labels.to(self.device)
-            output=F.normalize(self.model.encode_image(images.to(self.device)),dim=-1)
-            pred=(self.model.logit_scale*output@embeddings.t()).argmax(-1)
-            task_ids=torch.bucketize(labels,boundaries,right=True)-1
-            for i in range(len(self.indices)):
-                mask=task_ids==i
-                total[i]+=int(mask.sum());correct[i]+=int((pred[mask]==labels[mask]).sum())
-        if any(n==0 for n in total): raise ValueError('An evaluation task has no samples')
-        accuracies=[100*c/n for c,n in zip(correct,total)]
-        for i,acc in enumerate(accuracies):
-            print(f'* Task {i} Accuracy: {acc:.1f}%')
-        print(f'* Average Accuracy: {np.mean(accuracies):.1f}%')
-        return accuracies
-
     def test_zero_shot(self):
-        return self.evaluate()
+        self.model.eval()
+        self.evaluator.reset(self.indices)
 
-    def save_checkpoint(self,path):
-        os.makedirs(os.path.dirname(path) or '.',exist_ok=True)
-        torch.save(dict(model=self.model.state_dict(),completed_tasks=self.completed_tasks,
-            seen_prompts=self.seen_prompts,accuracy_table=self.accuracy_table,config=dict(self.cfg),
-            torch_rng=torch.get_rng_state(),numpy_rng=np.random.get_state(),python_rng=random.getstate(),
-            cuda_rng=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None),path)
+        print("==================================================================================")
+        print(f"Evaluate on the test set")
+        data_loader = self.TAIL_test_loader
 
-    def load_checkpoint(self,path):
-        # Only load trusted local checkpoints: metadata contains RNG Python objects.
-        state=torch.load(path,map_location='cpu',weights_only=False)
-        for key in ('dataset_sequence','backbone','checkpoint_path','rank','topk','temp','prune_thre','target_encoder','target_modules','template'):
-            if state['config'][key]!=self.cfg[key]: raise ValueError(f'Checkpoint config mismatch: {key}')
-        completed=state['completed_tasks']
-        if not 1<=completed<=len(self.cfg.dataset_sequence): raise ValueError('Invalid completed_tasks')
-        for _ in range(completed-1): increment_task(self.model)
-        self.model.load_state_dict(state['model'],strict=True)
-        self.completed_tasks=completed;self.seen_prompts=state['seen_prompts'];self.accuracy_table=state['accuracy_table']
-        torch.set_rng_state(state['torch_rng']);np.random.set_state(state['numpy_rng']);random.setstate(state['python_rng'])
-        if state['cuda_rng'] is not None and torch.cuda.is_available(): torch.cuda.set_rng_state_all(state['cuda_rng'])
-        print(f'Resumed after {completed} tasks from {path}')
+        for batch in tqdm(data_loader, ascii=True):
+            image = batch[0]
+            label = batch[1]
+            image = image.to(self.device)
+            label = label.to(self.device)
+
+            output = self.model(image)
+
+            self.evaluator.process(output, label)
+
+        results = self.evaluator.evaluate()
+
+        return results
+
+    @torch.no_grad()
+    def test_cur_task(self):
+        self.model.eval()
+        indices = [0]
+        self.evaluator.reset(indices)
+
+        print("==================================================================================")
+        print(f"Evaluate on the current task test set")
+        data_loader = self.test_loader
+        text_features = self.model.encode_text(self.model.prompts)
+
+        for batch in tqdm(data_loader, ascii=True):
+            image = batch[0]
+            label = batch[1]
+            image = image.to(self.device)
+            label = label.to(self.device)
+
+            output = self.model(image, 
+                                text_features=text_features)
+
+            self.evaluator.process(output, label)
+
+        results = self.evaluator.evaluate()
+
+        return results
+
+    @torch.no_grad()
+    def test_w_selector(self):
+        '''
+        Use the original CLIP as a selector to determine whether the input image belongs to a seen class or an unseen class;
+        For images predicted as seen classes by the selector, use the trained model for prediction;
+        For images predicted as unseen classes by the selector, use the original CLIP for prediction.
+        '''
+        cfg = self.cfg
+        self.model.eval()
+        indices = self.indices
+        self.evaluator.reset(indices)
+
+        data_loader = self.TAIL_test_loader
+
+        # Load zero shot CLIP
+        clip_model = load_clip_to_cpu(cfg.backbone, cfg.prec, cfg.checkpoint_path)
+        frozen_clip = ZeroShotCLIP(clip_model)
+        frozen_clip.to(self.device)
+        frozen_clip.init_text_features(self.merged_classnames, ['a photo of a {}.'], clip.tokenize, self.device)
+        frozen_clip.eval()
+
+        # For seen class names(ID), use the text features from the trained model
+        id_text_features = self.text_prototypes
+        id_num = id_text_features.shape[0]
+
+        print("==================================================================================")
+        print(f"Evaluate on the X-TAIL test set")
+
+        for batch in tqdm(data_loader, ascii=True):
+            image = batch[0]
+            label = batch[1]
+            image = image.to(self.device)
+            label = label.to(self.device)
+
+            zs_output = frozen_clip(image)
+            zs_pred = zs_output.max(1)[1]
+            
+            id_indices = (zs_pred < id_num).nonzero(as_tuple=True)[0]
+            ood_indices = (zs_pred >= id_num).nonzero(as_tuple=True)[0]
+
+            if id_indices.numel() > 0:
+                id_image = image[id_indices]
+                id_output = self.model(id_image, 
+                                       text_features=id_text_features)
+                # Pad zeros at the end of id_output to match zs_output size
+                pad_size = zs_output.shape[1] - id_output.shape[1]
+                if pad_size > 0:
+                    padding = torch.zeros(id_output.shape[0], pad_size).to(id_output.device)
+                    id_output_padded = torch.cat([id_output, padding], dim=1)
+                else:
+                    id_output_padded = id_output
+            else:
+                id_output_padded = None
+
+            if ood_indices.numel() > 0:
+                ood_output = zs_output[ood_indices]
+            else:
+                ood_output = None
+
+            # Combine id_output_padded and ood_output to form output, ensuring that the order matches the images in the batch
+            output = torch.zeros_like(zs_output)
+            if id_output_padded is not None:
+                output[id_indices] = id_output_padded
+            if ood_output is not None:
+                output[ood_indices] = ood_output
+
+            self.evaluator.process(output, label)
+
+        results = self.evaluator.evaluate()
+
+        return results
+
+    @torch.no_grad()
+    def test_wo_selector(self):
+        '''
+        Use text prototypes extracted by the trained model as text features for seen classes;
+        Use text features extracted by the original CLIP as text features for unseen classes.
+        Concatenate these as the complete set of text features, and input them together with LADA features into the trained model for prediction.
+        '''
+        cfg = self.cfg
+        self.model.eval()
+        indices = self.indices
+        self.evaluator.reset(indices)
+
+        data_loader = self.TAIL_test_loader
+
+        # Load zero shot CLIP
+        clip_model = load_clip_to_cpu(cfg.backbone, cfg.prec, cfg.checkpoint_path)
+        frozen_clip = ZeroShotCLIP(clip_model)
+        frozen_clip.to(self.device)
+        frozen_clip.init_text_features(self.merged_classnames, ['a photo of a {}.'], clip.tokenize, self.device)
+        frozen_clip.eval()
+
+        # For the seen class names(ID), use the text features from the trained model; 
+        # for the unseen class names(OOD), use the text features from the original CLIP
+        origin_text_features = frozen_clip.text_features
+        id_text_features = self.text_prototypes
+        id_num = id_text_features.shape[0]
+        ood_text_features = origin_text_features[id_num:,:]
+        text_features = torch.cat((id_text_features, ood_text_features), dim=0)
+
+        print("==================================================================================")
+        print(f"Evaluate on the X-TAIL test set")
+
+        for batch in tqdm(data_loader, ascii=True):
+            image = batch[0]
+            label = batch[1]
+            image = image.to(self.device)
+            label = label.to(self.device)
+
+            output = self.model(image, 
+                                text_features=text_features)
+
+            self.evaluator.process(output, label)
+
+        results = self.evaluator.evaluate()
+
+        return results
+
+    @torch.no_grad()
+    def save_model(self, directory):
+        checkpoint = {
+            'model': {name: value for name, value in self.model.state_dict().items()
+                      if name not in ('prompts', 'text_features')},
+            'text_prototypes': self.text_prototypes,
+            'seen_prompts': self.seen_prompts,
+            'completed_tasks': self.completed_tasks,
+            'config': dict(self.cfg),
+        }
+        os.makedirs(directory, exist_ok=True)
+        save_path = os.path.join(directory, 'checkpoint.pth.tar')
+        torch.save(checkpoint, save_path)
+        print(f'Checkpoint saved to {save_path}')
+
+    @torch.no_grad()
+    def load_model4CL(self, directory, load_path=None):
+        load_path = load_path or os.path.join(directory, 'checkpoint.pth.tar')
+        print('Loading model weights from {}'.format(load_path))
+        if not os.path.exists(load_path):
+            raise FileNotFoundError('Checkpoint not found at "{}"'.format(load_path))
+        checkpoint = torch.load(load_path, map_location=self.device, weights_only=True)
+        for key in ('dataset_sequence', 'backbone', 'checkpoint_path', 'rank', 'topk', 'temp',
+                    'prune_thre', 'target_encoder', 'target_modules'):
+            if checkpoint['config'][key] != self.cfg[key]:
+                raise ValueError(f'Checkpoint config mismatch: {key}')
+        completed = checkpoint['completed_tasks']
+        if not 1 <= completed <= len(self.cfg.dataset_sequence):
+            raise ValueError('Invalid completed_tasks')
+        for _ in range(completed - 1):
+            increment_task(self.model)
+        self.model.load_state_dict(checkpoint['model'], strict=True)
+        self.text_prototypes = checkpoint['text_prototypes'].to(self.device)
+        self.seen_prompts = checkpoint['seen_prompts']
+        self.completed_tasks = completed

@@ -26,6 +26,7 @@ class WorkflowTests(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.cfg=_C.clone()
         self.cfg.dataset_sequence=['aircraft','caltech101']
+        self.cfg.dataset='aircraft'
         self.cfg.device='cpu';self.cfg.resolution=8;self.cfg.num_workers=0
         self.cfg.iterations=2;self.cfg.batch_size=2;self.cfg.print_freq=1
         self.cfg.output_dir=self.tmp.name
@@ -38,39 +39,47 @@ class WorkflowTests(unittest.TestCase):
         self.dataset_patch.start();self.addCleanup(self.dataset_patch.stop)
 
     def test_two_tasks_save_resume_and_zeroshot(self):
-        first=self.cfg.clone();first.dataset='aircraft'
+        first=self.cfg.clone();first.dataset='aircraft';first.continue_train=True;first.continue_train_first=True
         trainer=Trainer(first)
         initial={n:p.detach().clone() for n,p in trainer.model.named_parameters() if not p.requires_grad}
         trainer.train()
         self.assertEqual(trainer.completed_tasks,1)
+        self.assertIsInstance(trainer.test_w_selector(),dict)
         for n,p in trainer.model.named_parameters():
             if n in initial: torch.testing.assert_close(p,initial[n],rtol=0,atol=0)
         checkpoint=str(Path(self.tmp.name)/'checkpoint.pth.tar')
         resume=self.cfg.clone();resume.dataset='caltech101';resume.model_dir=self.tmp.name;resume.continue_train=True
         resumed=Trainer(resume)
         self.assertEqual(resumed.completed_tasks,1)
-        for n,p in trainer.model.state_dict().items(): torch.testing.assert_close(p,resumed.model.state_dict()[n],rtol=0,atol=0)
+        self.assertTrue(any('old_lora_A' in n for n,_ in resumed.model.named_parameters()))
+        self.assertTrue(all(not p.requires_grad for n,p in resumed.model.named_parameters() if 'old_lora_' in n))
         resumed.train()
         self.assertEqual(resumed.completed_tasks,2)
         self.assertEqual(len(resumed.seen_prompts),4)
-        final=self.cfg.clone();final.resume=str(Path(self.tmp.name)/'checkpoint.pth.tar')
-        restored=Trainer(final)
-        for n,p in resumed.model.state_dict().items(): torch.testing.assert_close(p,restored.model.state_dict()[n],rtol=0,atol=0)
-        self.assertEqual(len(restored.evaluate()),2)
+        from clip import clip
+        from models.models import MoRAM_CLIP
+        final=self.cfg.clone()
+        restored=Trainer.__new__(Trainer)
+        restored.cfg=final;restored.device=torch.device('cpu')
+        base,_=clip.load(final.checkpoint_path,device='cpu',jit=False)
+        restored.model=MoRAM_CLIP(final,base)
+        restored.load_model4CL(self.tmp.name)
+        saved={n:p for n,p in resumed.model.state_dict().items() if n not in ('prompts','text_features')}
+        for n,p in saved.items(): torch.testing.assert_close(p,restored.model.state_dict()[n],rtol=0,atol=0)
         zero=self.cfg.clone();zero.zero_shot=True
         reference=Trainer(zero)
         self.assertFalse(any(p.requires_grad for p in reference.model.parameters()))
-        self.assertEqual(len(reference.test_zero_shot()),2)
+        self.assertIsInstance(reference.test_zero_shot(),dict)
 
     def test_encoder_modes_update_and_losses_finite(self):
         for target in ['vision','text','all']:
             cfg=self.cfg.clone();cfg.target_encoder=target
             trainer=Trainer(cfg)
-            loader,names=trainer.current_loader('aircraft')
             before={n:p.clone() for n,p in trainer.model.named_parameters() if p.requires_grad}
-            losses=trainer.train_task(loader,names,'aircraft')
-            self.assertEqual(len(losses),2)
-            self.assertTrue(all(np.isfinite(losses)))
+            with patch.object(trainer.optim,'step',wraps=trainer.optim.step) as step:
+                trainer.train()
+                self.assertEqual(step.call_count,2)
+            self.assertTrue(all(torch.isfinite(p).all() for p in trainer.model.parameters()))
             self.assertTrue(any(not torch.equal(p,before[n]) for n,p in trainer.model.named_parameters() if n in before))
 
     def test_upstream_optimizer_schedule_and_loss_recipe(self):

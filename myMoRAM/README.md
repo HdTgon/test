@@ -74,11 +74,11 @@ prec=fp32 与原 MoRAM 无 autocast 的训练保持一致；本实现拒绝其�
 
 ## Checkpoint 与评估
 
-与 LADA 相同：通过 `model_dir/checkpoint.pth.tar` 读取前任务结果；main 未指定 model_dir 时使用当前 output_dir。模型与历史 LoRA、已完成任务、历史 prompts、配置和随机状态一同保存。任务顺序和 LoRA 配置需一致；检查任务索引，防止误跳过历史训练。
+与 LADA 相同：通过 `model_dir/checkpoint.pth.tar` 读取前任务结果；main 未指定 model_dir 时使用当前 output_dir。模型与历史 LoRA、已完成任务、历史 prompts、配置一同保存。任务顺序和 LoRA 配置需一致；检查任务索引，防止误跳过历史训练。
 
 checkpoint 仅支持任务边界恢复。可选 resume 字段用于显式指定 checkpoint 文件，但标准脚本不需要它。只加载可信本地 checkpoint。
 
-每任务评估 LADA 全序列测试集，统一 prompt 和类别顺序。输出 `* Task i Accuracy: ...%`，由 LADA result_process.py 解析；另有 accuracies.csv。非当前任务内的局部候选类别评估。
+评估严格保留 LADA 的 test_cur_task / test_zero_shot / test_wo_selector / test_w_selector 结构。不带 selector 时，已见类别使用每任务结束缓存的训练模型文本特征，未见类别使用冻结 CLIP 文本特征（与 LADA 相同），不再将全部类别用当前模型重新编码。输出 `* Task i Accuracy: ...%`，由 LADA result_process.py 解析。非当前任务内的局部候选类别评估。
 
 ## 验证
 
@@ -87,8 +87,23 @@ cd myMoRAM
 PYTHONDONTWRITEBYTECODE=1 /workspace/moram-venv/bin/python -m unittest discover -s tests -v
 ```
 
-4 项 CPU 集成测试通过：实际参数配置与 LADA 入口约定、三种编码器模式的真实更新、两任务独立启动/自动 checkpoint 衔接/再次恢复/zero-shot，以及 MoRAM optimizer、cosine schedule 和上传损失公式。测试使用小型随机 CLIP、内存 PIL 图片及真实 LADA DataLoader/增强流程。
+4 项 CPU 集成测试通过：实际参数配置与 LADA 入口约定、三种编码器模式的真实更新、两任务独立启动/自动 checkpoint 衔接/再次恢复/zero-shot，以及 MoRAM optimizer、cosine schedule 和上传损失公式；同时执行当前任务、zero-shot、带/不带 selector 评估。测试使用小型随机 CLIP、内存 PIL 图片及真实 LADA DataLoader/增强流程。
 
 未验证正式权重、真实 X-TAIL、GPU 或论文精度；不能据此判断实际 zero-shot gap 已消除。
 
 来源：LADA `c74806cd8ebe50f51dc6b448d3abe404ff4b41cb`；MoRAM `aaa51d8ec67171e1bc5e1a1168351588561256c4`，以及用户上传训练逻辑。
+
+
+## trainer.py 与 LADA 原版的必要差异
+
+Trainer 的方法集合与 LADA 原版完全相同，没有另建 current_loader/train_task/evaluate 等训练控制接口。
+
+- `__init__`：保持设备、数据/模型构建、Evaluator 初始化顺序；补 MoRAM 历史状态与配方检查。
+- `build_data_loader`、`test_zero_shot`：与 LADA 原版方法完全一致。
+- `load_clip_to_cpu`：仍按 LADA 构建；增加本地 checkpoint 路径并修复普通 state_dict 上错误调用 eval 的问题。
+- `build_model`：PeftModelFromCLIP 替换成 MoRAM_CLIP；历史 A/B 恢复/递增替代 DPT/LADA 构建。
+- `build_optimizer` / `build_criterion` / `train`：只改 MoRAM 必需的参数组、AdamW、cosine、固定迭代数和双向损失；保留 LADA 的 epoch/batch 骨架、AverageMeter、ETA、训练后保存及评估顺序。epoch 数根据 iteration cap 推导，不使用 cfg.num_epochs 改写 MoRAM 的总步数。
+- 其余三个测试方法：保留 LADA 流程，只移除 text_tuner、lada_features、classifier 等已不存在的参数，文本原型改为 Trainer 缓存。
+- `save_model` / `load_model4CL`：同名、同 checkpoint 路径，内容替换为 MoRAM 模型/历史因子与文本缓存。不兼容上一版开发中的 checkpoint 格式，需重新开始实验。
+
+重新使用原 LADA `utils/evaluator.py`；只给 task selection precision 的零分母增加保护，未改变有预测样本时的计算。checkpoint 保持任务边界恢复，不额外承诺恢复随机状态或迭代中间恢复。
