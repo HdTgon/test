@@ -376,32 +376,17 @@ class Trainer:
 
     @torch.no_grad()
     def test_wo_selector(self):
-        '''
-        Encode seen class prompts with the trained model;
-        Use text features extracted by the original CLIP as text features for unseen classes.
-        Concatenate these as the complete set of text features, and input them together with LADA features into the trained model for prediction.
-        '''
-        cfg = self.cfg
+        """Encode all class prompts with the current MoRAM model, as in XTAIL."""
         self.model.eval()
         indices = self.indices
         self.evaluator.reset(indices)
 
         data_loader = self.TAIL_test_loader
 
-        # Load zero shot CLIP
-        clip_model = load_clip_to_cpu(cfg.backbone, cfg.prec, cfg.checkpoint_path)
-        frozen_clip = ZeroShotCLIP(clip_model)
-        frozen_clip.to(self.device)
-        frozen_clip.init_text_features(self.merged_classnames, ['a photo of a {}.'], clip.tokenize, self.device)
-        frozen_clip.eval()
-
-        # For the seen class names(ID), use the text features from the trained model; 
-        # for the unseen class names(OOD), use the text features from the original CLIP
-        origin_text_features = frozen_clip.text_features
-        id_text_features = self.model.encode_text(clip.tokenize(self.seen_prompts).to(self.device))
-        id_num = id_text_features.shape[0]
-        ood_text_features = origin_text_features[id_num:,:]
-        text_features = torch.cat((id_text_features, ood_text_features), dim=0)
+        # Preserve the global class order used by the test labels.
+        prompts = ['a photo of a {}.'.format(name.replace('_', ' '))
+                   for name in self.merged_classnames]
+        text_features = self.model.encode_text(clip.tokenize(prompts).to(self.device))
 
         print("==================================================================================")
         print(f"Evaluate on the X-TAIL test set")
