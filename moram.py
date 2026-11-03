@@ -589,8 +589,12 @@ def apply_lora(cfg, model, encoder=''):
 
 
 
-def get_moram(cfg):
-    """Use LADA OpenAI CLIP weights, tokenizer, graph and precision."""
+def get_moram(cfg, zero_shot=False):
+    """Build an independent frozen reference or a LoRA-trainable CLIP.
+
+    zero_shot is an explicit per-call switch, independent of cfg['zero_shot'].
+    Both branches return moram_CLIPModel with (features, loss) encode methods.
+    """
     from clip import clip
     device = torch.device(cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
     backbone = cfg.get("backbone_type", "ViT-B-16")
@@ -609,22 +613,25 @@ def get_moram(cfg):
     else:
         clip_model.float()
     logging.info("CLIP backend=LADA/OpenAI backbone=%s precision=%s checkpoint=%s", backbone, prec, cfg.get("checkpoint_path", "official OpenAI SHA256-verified download"))
-    if cfg.get("zero_shot", False):
-        model = ZeroShotFeatureCLIP(clip_model).to(device).eval()
-    else:
-        if not hasattr(clip_model.visual, "transformer"):
-            raise ValueError("MoRAM requires a ViT backbone")
-        model = moram_CLIPModel(clip_model)
-        target = cfg.get("target_encoder", "all")
-        if target not in ("vision", "text", "all"):
-            raise ValueError(f"Invalid target_encoder: {target}")
-        if target in ("vision", "all"):
-            apply_lora(cfg, model.visual.transformer, encoder="visual.")
-        if target in ("text", "all"):
-            apply_lora(cfg, model.transformer)
-        for name, param in model.named_parameters():
-            param.requires_grad = "lora_" in name and "old" not in name and "weight" not in name and "bias" not in name
+    if not hasattr(clip_model.visual, "transformer"):
+        raise ValueError("MoRAM requires a ViT backbone")
+    model = moram_CLIPModel(clip_model)
+    if zero_shot:
+        model.requires_grad_(False)
         model.to(device).eval()
+        return model, preprocess, preprocess, clip.tokenize
+
+    logging.info("Total number of CLIP parameters: %s", sum(p.numel() for p in clip_model.parameters()))
+    target = cfg.get("target_encoder", "all")
+    if target not in ("vision", "text", "all"):
+        raise ValueError(f"Invalid target_encoder: {target}")
+    if target in ("vision", "all"):
+        apply_lora(cfg, model.visual.transformer, encoder="visual.")
+    if target in ("text", "all"):
+        apply_lora(cfg, model.transformer)
+    for name, param in model.named_parameters():
+        param.requires_grad = "lora_" in name and "old" not in name and "weight" not in name and "bias" not in name
+    model.to(device)
     return model, preprocess, preprocess, clip.tokenize
 
 
