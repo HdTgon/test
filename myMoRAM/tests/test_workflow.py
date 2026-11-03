@@ -48,6 +48,10 @@ class WorkflowTests(unittest.TestCase):
         for n,p in trainer.model.named_parameters():
             if n in initial: torch.testing.assert_close(p,initial[n],rtol=0,atol=0)
         checkpoint=str(Path(self.tmp.name)/'checkpoint.pth.tar')
+        checkpoint_state=torch.load(checkpoint,weights_only=True)
+        self.assertNotIn('model',checkpoint_state)
+        self.assertIn('lora_ranks',checkpoint_state)
+        self.assertTrue(all(not k.endswith(('.weight','.bias')) for k in checkpoint_state['state_dict']))
         resume=self.cfg.clone();resume.dataset='caltech101';resume.model_dir=self.tmp.name;resume.continue_train=True
         resumed=Trainer(resume)
         self.assertEqual(resumed.completed_tasks,1)
@@ -131,6 +135,41 @@ class WorkflowTests(unittest.TestCase):
         expected=F.cross_entropy(expected_logits,labels)+F.cross_entropy(scale*text@image.T,target)
         torch.testing.assert_close(loss,expected,atol=0,rtol=0)
         self.assertTrue(torch.isfinite(loss))
+
+class MoRAMUtilityTests(unittest.TestCase):
+    def test_lora_only_roundtrip_ranks_dtype_and_frozen_history(self):
+        from models.models import MoRAM_Linear
+        from utils.moram_utils import torch_save_lora, torch_load_lora
+        torch.manual_seed(10)
+        model=torch.nn.Sequential(MoRAM_Linear(8,6,r=4,topk=2,lora_threshold=0)).double()
+        with torch.no_grad(): model[0].lora_B.normal_()
+        model[0].increment_task()
+        with torch.no_grad(): model[0].lora_B.normal_()
+        model[0].lora_scaling=0.37
+        model.eval()
+        x=torch.randn(3,8,dtype=torch.float64)
+        expected=model(x)[0]
+        loaded=torch.nn.Sequential(MoRAM_Linear(8,6,r=4,topk=2,lora_threshold=0)).double().eval()
+        with torch.no_grad():
+            loaded[0].weight.copy_(model[0].weight)
+            loaded[0].bias.copy_(model[0].bias)
+        with tempfile.TemporaryDirectory() as tmp:
+            path=str(Path(tmp)/'lora.pth')
+            torch_save_lora(model,path,MoRAM_Linear)
+            state=torch.load(path,weights_only=True)
+            self.assertEqual(set(state),{'state_dict','lora_ranks'})
+            self.assertTrue(state['state_dict'])
+            self.assertFalse(any(k.endswith(('.weight','.bias')) for k in state['state_dict']))
+            torch_load_lora(loaded,path,MoRAM_Linear)
+            torch.testing.assert_close(loaded(x)[0],expected,rtol=0,atol=0)
+            self.assertEqual((loaded[0].rank,loaded[0].old_rank),(4,4))
+            self.assertEqual(loaded[0].lora_A.dtype,torch.float64)
+            self.assertFalse(loaded[0].old_lora_A.requires_grad)
+            self.assertTrue(loaded[0].lora_A.requires_grad)
+            self.assertEqual(loaded[0].lora_scaling,0.37)
+            del state['state_dict']['0.lora_A']
+            torch.save(state,path)
+            with self.assertRaises(ValueError):torch_load_lora(loaded,path,MoRAM_Linear)
 
 class LADACompatibilityTests(unittest.TestCase):
     def test_entry_and_experiment_config(self):

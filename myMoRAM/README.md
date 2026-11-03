@@ -134,3 +134,35 @@ trainer.load_or_extract_zero_shot_prototypes(cfg.output_dir, force=True)
 这些 zero-shot 原型仅作为对照保存，不参与 MoRAM replay 或损失；模型 checkpoint 仍需保存实际 LoRA 和历史因子，保证持续学习。没有这些原型字段的旧开发 checkpoint 需要从第一任务重新开始。
 
 现有 5 项 CPU 测试通过，新增验证缓存命中不做图像编码、手工均值结果一致、强制重算、元数据变化失效、随机状态恢复，以及两任务原型累计与 checkpoint 加载。
+
+## MoRAM utilities 与 LoRA-only checkpoint
+
+已将上游 `XTAIL/utils.py` 导入为 `utils/moram_utils.py`，避免根目录 `utils.py` 与 LADA `utils/` 包同名冲突。
+
+- `assign_learning_rate`、`_warmup_lr`、`cosine_lr` 与上游实现完全一致，Trainer 直接使用此处的 cosine_lr。
+- `utils/scheduler.py` 只是兼容 re-export，不再有第二份调度器实现。
+- `torch_save_lora` / `torch_load_lora` 负责 MoRAM factors 与 rank 的持久化，Trainer 的 save_model/load_model4CL 已接入。
+
+`checkpoint.pth.tar` 结构现在是：
+
+```python
+{
+    'state_dict': ...,    # 仅 LoRA A/B、历史 A/B、gate 等；无 CLIP backbone 权重
+    'lora_ranks': ...,    # 每层 rank / old_rank / init_rank / lora_scaling
+    'text_prototypes': ...,
+    'image_prototypes': ...,
+    'zero_shot_text_prototypes': ...,
+    'prototype_counts': ...,
+    'seen_prompts': ...,
+    'completed_tasks': ...,
+    'config': ...,
+}
+```
+
+这替换了早期开发版本的完整 `model` state。恢复时先正常加载同一份原始 CLIP，然后依据保存的 rank 重建 A/B、严格检查 LoRA 张量并加载；不再靠重复 increment_task 猜历史形状。随后按 LADA 流程为下一个任务递增一次，并重建 optimizer。
+
+相比原版工具函数，只补齐必要兼容：weights_only 安全读取、按目标层的 device/dtype 分配 Parameter、历史因子冻结、gate buffer 恢复，以及 lora_scaling/init_rank 保存。工具函数在重建 Parameter 后要求重新创建 optimizer。纯工具调用仍保持原签名；save 函数额外支持可选 extra_state，以便原型和任务元数据一次写入同一个 checkpoint。
+
+旧版完整模型 checkpoint 不能直接加载新格式，需重训或单独迁移。恢复必须使用相同 backbone 权重及模型配置，LoRA-only checkpoint 不包含原始 CLIP 权重。
+
+当前 6 项 CPU 测试通过，新增验证非零历史/当前 LoRA 的保存恢复结果逐元素相同、rank 与 dtype、历史冻结、损坏参数检测，以及 checkpoint 中确实没有 backbone weight/bias。正式 GPU 测试尚未运行。

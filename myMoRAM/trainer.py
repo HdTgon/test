@@ -12,10 +12,10 @@ from torchvision import transforms
 
 from clip import clip
 from scenario_datasets.build_functions import build_cur_task_data_loader, build_TAIL_testloader
-from models.models import ZeroShotCLIP, MoRAM_CLIP, increment_task
+from models.models import ZeroShotCLIP, MoRAM_CLIP, MoRAM_Linear, increment_task
 from utils.meter import AverageMeter
 from utils.evaluator import Evaluator
-from utils.scheduler import cosine_lr
+from utils.moram_utils import cosine_lr, torch_save_lora, torch_load_lora
 
 def build_optimizer(cfg, model):
     # Exact upstream MoRAM optimizer, including beta2=0.9999 (not LADA's default).
@@ -490,8 +490,6 @@ class Trainer:
     @torch.no_grad()
     def save_model(self, directory):
         checkpoint = {
-            'model': {name: value for name, value in self.model.state_dict().items()
-                      if name not in ('prompts', 'text_features')},
             'text_prototypes': self.text_prototypes,
             'image_prototypes': self.image_prototypes,
             'zero_shot_text_prototypes': self.zero_shot_text_prototypes,
@@ -502,8 +500,7 @@ class Trainer:
         }
         os.makedirs(directory, exist_ok=True)
         save_path = os.path.join(directory, 'checkpoint.pth.tar')
-        torch.save(checkpoint, save_path)
-        print(f'Checkpoint saved to {save_path}')
+        torch_save_lora(self.model, save_path, MoRAM_Linear, extra_state=checkpoint)
 
     @torch.no_grad()
     def load_model4CL(self, directory, load_path=None):
@@ -519,9 +516,7 @@ class Trainer:
         completed = checkpoint['completed_tasks']
         if not 1 <= completed <= len(self.cfg.dataset_sequence):
             raise ValueError('Invalid completed_tasks')
-        for _ in range(completed - 1):
-            increment_task(self.model)
-        self.model.load_state_dict(checkpoint['model'], strict=True)
+        torch_load_lora(self.model, load_path, MoRAM_Linear)
         self.text_prototypes = checkpoint['text_prototypes'].to(self.device)
         for key in ('image_prototypes', 'zero_shot_text_prototypes', 'prototype_counts'):
             value = checkpoint.get(key)
