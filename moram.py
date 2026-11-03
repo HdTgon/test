@@ -11,7 +11,7 @@ from torch import nn
 from torch.nn import functional as F
 from torch.nn.parameter import Parameter
 
-lora = None
+import loralib as lora
 
 class moram_CLIPModel(torch.nn.Module):
     def __init__(self, original_model):
@@ -589,38 +589,259 @@ def apply_lora(cfg, model, encoder=''):
 
 
 
-def get_moram(cfg, lora_module=None):
-    """Build LADA's CLIP, wrap it, then inject the caller's MoRAM layers.
-
-    Returns (model, train_transform, test_transform, tokenizer). LADA uses
-    the same deterministic preprocessing for both transforms here.
-    """
-    global lora
-    device = torch.device(cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
-    backbone = cfg.get("backbone_type", cfg.get("backbone", "ViT-B/16"))
-    if backbone.startswith("CLIP-"):
-        backbone = backbone[len("CLIP-"):]
-    if not cfg.get("zero_shot", False) and lora_module is None:
-        raise ImportError("Pass lora_module exposing the original MoRAM_Linear implementation; it is not included in the uploaded snippet.")
-    weight = cfg.get("pretrained_weight")
-    if weight not in (None, "openai"):
-        raise ValueError("LADA loader supports OpenAI weights; use checkpoint_path for a local checkpoint.")
+def get_moram(cfg):
+    """Use LADA OpenAI CLIP weights, tokenizer, graph and precision."""
     from clip import clip
-    clip_model, preprocess = clip.load(cfg.get("checkpoint_path", backbone), device=device, jit=False)
+    device = torch.device(cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
+    backbone = cfg.get("backbone_type", "ViT-B-16")
+    aliases = {"ViT-B-16": "ViT-B/16", "ViT-B-32": "ViT-B/32", "ViT-L-14": "ViT-L/14", "ViT-L-14-336": "ViT-L/14@336px"}
+    backbone = aliases.get(backbone, backbone.removeprefix("CLIP-"))
+    if cfg.get("pretrained_weight", "openai") != "openai":
+        raise ValueError("LADA parity requires pretrained_weight='openai'; use checkpoint_path for a local OpenAI checkpoint")
+    prec = cfg.get("prec", "fp32")
+    if prec not in ("fp32", "fp16", "amp"):
+        raise ValueError(f"Unsupported precision: {prec}")
+    # Load on CPU first, exactly as LADA's trainer does, before device transfer.
+    clip_model, preprocess = clip.load(cfg.get("checkpoint_path", backbone), device="cpu", jit=False)
+    if prec == "fp16":
+        from clip.model import convert_weights
+        convert_weights(clip_model)
+    else:
+        clip_model.float()
+    logging.info("CLIP backend=LADA/OpenAI backbone=%s precision=%s checkpoint=%s", backbone, prec, cfg.get("checkpoint_path", "official OpenAI SHA256-verified download"))
     if cfg.get("zero_shot", False):
-        return clip_model, preprocess, preprocess, clip.tokenize
-    if not hasattr(clip_model.visual, "transformer"):
-        raise ValueError("MoRAM wrapper requires a ViT CLIP backbone, not ResNet.")
-    target = cfg.get("target_encoder", "all")
-    if target not in ("vision", "text", "all"):
-        raise ValueError(f"Invalid target_encoder: {target}")
-    lora = lora_module
-    model = moram_CLIPModel(clip_model)
-    if target in ("vision", "all"):
-        apply_lora(cfg, model.visual.transformer, encoder="visual.")
-    if target in ("text", "all"):
-        apply_lora(cfg, model.transformer)
-    for name, param in model.named_parameters():
-        param.requires_grad = "lora_" in name and "old" not in name and "weight" not in name and "bias" not in name
-    model = model.to(device)
+        model = ZeroShotFeatureCLIP(clip_model).to(device).eval()
+    else:
+        if not hasattr(clip_model.visual, "transformer"):
+            raise ValueError("MoRAM requires a ViT backbone")
+        model = moram_CLIPModel(clip_model)
+        target = cfg.get("target_encoder", "all")
+        if target not in ("vision", "text", "all"):
+            raise ValueError(f"Invalid target_encoder: {target}")
+        if target in ("vision", "all"):
+            apply_lora(cfg, model.visual.transformer, encoder="visual.")
+        if target in ("text", "all"):
+            apply_lora(cfg, model.transformer)
+        for name, param in model.named_parameters():
+            param.requires_grad = "lora_" in name and "old" not in name and "weight" not in name and "bias" not in name
+        model.to(device).eval()
     return model, preprocess, preprocess, clip.tokenize
+
+
+class ZeroShotFeatureCLIP(nn.Module):
+    """Keep OpenCLIP's feature API while executing LADA's unmodified CLIP."""
+    def __init__(self, clip_model):
+        super().__init__()
+        self.clip = clip_model
+
+    @property
+    def logit_scale(self):
+        return self.clip.logit_scale
+
+    @property
+    def visual(self):
+        return self.clip.visual
+
+    def encode_image(self, image, normalize=False):
+        features = self.clip.encode_image(image)
+        return F.normalize(features, dim=-1) if normalize else features
+
+    def encode_text(self, text, normalize=False):
+        features = self.clip.encode_text(text)
+        return F.normalize(features, dim=-1) if normalize else features
+
+    def forward(self, image=None, text=None):
+        return (self.encode_image(image, normalize=True) if image is not None else None,
+                self.encode_text(text, normalize=True) if text is not None else None,
+                self.logit_scale.exp())
+
+
+import os
+import json
+import numpy as np
+def tensor2numpy(x):
+    return x.cpu().data.numpy() if x.is_cuda else x.data.numpy()
+
+def load_json(settings_path):
+    with open(settings_path) as data_file:
+        param = json.load(data_file)
+    return param  
+
+
+def finetune(args, model, tokenizer, dataset_name, dataset, train_loader):
+    import utils
+    model = model.cuda()
+    try:
+        if len(args.seen_classes) > 0 and not args.mtil_eval:
+            for name, module in model.named_modules():
+                if isinstance(module, lora.MoRAM_Linear):
+                    module.increment_task()
+            logging.info('finished increment task, saved old lora, and initialized new lora')
+    except Exception:
+        if len(args.seen_classes) > 0:
+            for name, module in model.named_modules():
+                if isinstance(module, lora.MoRAM_Linear):
+                    module.increment_task()
+            logging.info('finished increment task, saved old lora, and initialized new lora')
+
+    for name, param in model.named_parameters():
+        param.requires_grad = False
+        if 'lora_' in name:
+            param.requires_grad = True
+        if 'old' in name:
+            param.requires_grad = False
+
+    ckpt_path = os.path.join(args.save, f"{dataset_name}.pth") if args.save is not None else None
+    train_model(args, model, tokenizer, dataset_name, dataset, train_loader)
+
+    if args.save is not None:
+        if isinstance(model, torch.nn.DataParallel):
+            to_save_model = model.module
+        else:
+            to_save_model = model
+        path = ckpt_path if ckpt_path is not None else os.path.join(args.save, f"{dataset_name}.pth")
+        utils.torch_save_lora(to_save_model, path, lora.MoRAM_Linear)
+
+    template = dataset.template[0]
+    class_names = dataset.classnames
+    args.seen_classes += [template.format(l) for l in class_names]
+    
+    
+def train_model(args, model, tokenizer, dataset_name, dataset, train_loader):
+    import utils
+    from torch.utils.tensorboard import SummaryWriter
+    from tqdm import tqdm
+    writer = SummaryWriter(log_dir=os.path.join("runs", args.save, dataset_name))
+    
+    loss_interval = len(train_loader) 
+    num_batches = len(train_loader)
+    total_iterations = args.iterations  # 1000
+    logging.info(f"Iterations per epoch: {num_batches}")
+    logging.info(f"Total iterations: {total_iterations}")
+
+    total_params_size = sum(p.numel() * p.element_size() for p in model.parameters() if p.requires_grad)
+    logging.info(f'The number of Total Trainable Parameters------------------: {sum(p.numel() for p in model.parameters() if p.requires_grad)}')
+    logging.info(f"Total Trainable Parameters Memory Size: {total_params_size / 1024 / 1024:.2f} MB")
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.wd, betas=(0.9, 0.9999)
+    )
+    scheduler = utils.cosine_lr(
+        optimizer, args.lr, args.warmup_length, total_iterations
+    )
+
+    model = model.cuda()
+    logit_scale = model.logit_scale
+    devices = list(range(torch.cuda.device_count()))
+    logging.info(f"Using devices {devices}")
+    model = torch.nn.DataParallel(model, device_ids=devices) 
+
+    template = dataset.template[0]
+    class_names = dataset.classnames
+    seen_classes = copy.deepcopy(args.seen_classes)
+
+    if len(seen_classes) > 0:
+        with torch.no_grad():
+            texts = tokenizer(seen_classes).cuda()
+            if isinstance(model, torch.nn.DataParallel):
+                class_embeddings, _ = model.module.encode_text(texts)
+            else:
+                class_embeddings, _ = model.encode_text(texts)
+            class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
+            seen_embeddings = class_embeddings.cuda()
+    
+    if args.target_encoder == 'vision':
+        with torch.no_grad():
+            texts = [template.format(l) for l in class_names]
+            texts = tokenizer(texts).cuda()
+            if isinstance(model, torch.nn.DataParallel):
+                class_embeddings, _ = model.module.encode_text(texts)
+            else:
+                class_embeddings, _ = model.encode_text(texts)
+            class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
+            cur_embeddings = class_embeddings.cuda()
+        
+        if len(seen_classes) > 0:
+            embeddings = torch.cat([seen_embeddings, cur_embeddings], dim=0).cuda()
+        else:
+            embeddings = cur_embeddings.cuda()
+        print(len(seen_classes), len(texts), embeddings.shape)
+
+    correct, total = 0, 0
+    for iteration in tqdm(range(total_iterations)):
+        if iteration % num_batches == 0:
+            data_iter = iter(train_loader)
+
+        model.train()
+        scheduler(iteration)
+
+        try:
+            images, labels = next(data_iter)
+        except:
+            data_iter = iter(train_loader)
+            images, labels = next(data_iter)
+        images, labels = images.cuda(), labels.cuda()
+        labels += len(seen_classes)
+
+        sparse_losses = 0
+
+        # Text embeddings for contrastive loss when training text or both encoders
+        if args.target_encoder == 'text' or args.target_encoder == 'all':
+            texts = [template.format(l) for l in class_names]
+            texts = tokenizer(texts).cuda()
+            if isinstance(model, torch.nn.DataParallel):
+                class_embeddings, _ = model.module.encode_text(texts)
+            else:
+                class_embeddings, _ = model.encode_text(texts)
+            class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
+            cur_embeddings = class_embeddings.cuda()
+
+            if len(seen_classes) > 0:
+                embeddings = torch.cat([seen_embeddings, cur_embeddings], dim=0).cuda()
+            else:
+                embeddings = cur_embeddings.cuda()
+
+            embeddings = embeddings.cuda()
+
+        out, _ = model.module.encode_image(images)
+        out = out / out.norm(dim=-1, keepdim=True)
+
+        logits_per_image = logit_scale.exp() * out @ embeddings.t()
+    
+        if len(seen_classes) > 0:
+            logits_per_image[:, :len(seen_classes)] = float('-inf')
+        
+        ce_loss = F.cross_entropy(logits_per_image, labels.long(), label_smoothing=args.ls)
+        
+        anchor_labels = labels.contiguous().view(-1, 1)
+        contrast_labels = torch.arange(embeddings.shape[0]).view(-1,1).cuda()
+        mask = torch.eq(anchor_labels, contrast_labels.T).float().cuda().t()
+        t_logits = logit_scale.exp() * embeddings @ out.t()
+        loss_ce_t = F.cross_entropy(t_logits, mask)
+
+        if args.target_encoder == 'vision' or args.target_encoder == 'all':
+            loss = ce_loss + loss_ce_t
+        else:
+            loss = ce_loss
+
+        optimizer.zero_grad()
+        loss.backward()
+        
+        optimizer.step()
+        
+        _, preds = torch.max(logits_per_image, dim=1)
+        correct += preds.eq(labels.expand_as(preds)).cpu().sum()
+        total += len(labels)
+        
+        writer.add_scalar(f'{dataset_name}/train', loss.item(), iteration)
+        writer.add_scalar(f'{dataset_name}/CE_i', ce_loss.item(), iteration)
+        writer.add_scalar(f'{dataset_name}/CE_t', loss_ce_t.item(), iteration)
+        writer.add_scalar(f'{dataset_name}/LR', optimizer.param_groups[0]['lr'], iteration)
+
+        if iteration % loss_interval == 0:
+            logging.info(
+                f"Loss: {loss.item()}, ce_loss: {ce_loss.item()}, ce_t_loss: {loss_ce_t.item()}, sparse: {sparse_losses}"
+            )
+            train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
+            logging.info(f"Train accuracy: {train_acc}%")
+            correct, total = 0, 0
