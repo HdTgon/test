@@ -7,8 +7,8 @@ import unittest
 import torch
 from Moram_clip import apply_lora, get_moram, increment_task
 from Moram_clip.clip.model import CLIP
-from Moram_clip.injection import MoRAMLinearTensor, PlainMultiheadAttentionLoRA
-from Moram_clip.moram_lora import MoRAM_Linear
+from Moram_clip.models import MoRAMLinearTensor, PlainMultiheadAttentionLoRA
+from Moram_clip.models import MoRAM_Linear
 
 
 class MoRAMCLIPTests(unittest.TestCase):
@@ -84,11 +84,11 @@ class MoRAMCLIPTests(unittest.TestCase):
             cfg=dict(self.cfg,checkpoint_path=checkpoint,device='cpu',prec='fp32')
             frozen,*_=get_moram(cfg,zero_shot=True)
             model,*_=get_moram(cfg)
-            self.assertIs(type(frozen),CLIP)
+            self.assertIs(type(frozen.clip_model),CLIP)
             self.assertFalse(any(p.requires_grad for p in frozen.parameters()))
             self.assertTrue(any(p.requires_grad for p in model.parameters()))
-            self.assertNotEqual(frozen.visual.conv1.weight.data_ptr(),model.visual.conv1.weight.data_ptr())
-            torch.testing.assert_close(frozen(self.image,self.text)[0],model(self.image,self.text)[0],atol=2e-5,rtol=2e-5)
+            self.assertNotEqual(frozen.image_encoder.conv1.weight.data_ptr(),model.image_encoder.conv1.weight.data_ptr())
+            torch.testing.assert_close(frozen.clip_model(self.image,self.text)[0],model(self.image,text=self.text),atol=2e-5,rtol=2e-5)
 
     def test_lora_rank_zero_rank_one_and_dtype(self):
         for rank in [0,1,4]:
@@ -100,5 +100,28 @@ class MoRAMCLIPTests(unittest.TestCase):
         model=apply_lora(self.base.double(),self.cfg)
         for m in model.modules():
             if isinstance(m,MoRAM_Linear): self.assertEqual(m.weight.dtype,torch.float64)
+
+    def test_lada_style_wrappers_and_template_ensemble(self):
+        from Moram_clip.models import ZeroShotCLIP, MoRAM_CLIP
+        frozen=ZeroShotCLIP(self.base).eval()
+        model=MoRAM_CLIP(self.cfg,self.base).eval()
+        def tokenize(prompts):
+            return self.text[:len(prompts)].clone()
+        classes=['a_cat','dog']
+        frozen.init_text_features(classes,['a {}','the {}'],tokenize,'cpu')
+        expected=torch.nn.functional.normalize(self.base.encode_text(self.text[:2]),dim=-1)
+        expected=torch.nn.functional.normalize(expected.mean(0),dim=-1).repeat(2,1)
+        torch.testing.assert_close(frozen.text_features,expected)
+        self.assertEqual(frozen(self.image).shape,(3,2))
+        model.init_prompts(classes,['a {}'],tokenize,'cpu')
+        logits=model(self.image)
+        torch.testing.assert_close(logits,self.base(self.image,self.text[:2])[0],rtol=2e-5,atol=2e-5)
+        self.assertNotEqual(model.image_encoder.conv1.weight.data_ptr(),self.base.visual.conv1.weight.data_ptr())
+        self.assertFalse(any(isinstance(m,MoRAM_Linear) for m in self.base.modules()))
+        model.train()
+        logits=model(self.image)
+        logits.square().mean().backward()
+        self.assertTrue(any(p.grad is not None for n,p in model.named_parameters() if n.endswith('.lora_B')))
+        self.assertTrue(all(p.grad is None for p in frozen.parameters()))
 
 if __name__=='__main__': unittest.main()

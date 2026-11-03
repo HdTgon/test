@@ -1,9 +1,254 @@
-"""Inject only MoRAM LoRA into the unchanged LADA CLIP modules."""
+"""LADA-style zero-shot reference and MoRAM CLIP; all routed LoRA lives here."""
+import copy
+import math
 from typing import Optional
 import torch
 from torch import nn
 from torch.nn import functional as F
-from . import moram_lora as lora
+from .clip.model import CLIP
+
+
+class ZeroShotCLIP(nn.Module):
+    """LADA zero-shot reference: normalize per prompt, average, normalize again.
+
+    Keep the original CLIP encoders. Copy the supplied backbone so references
+    and trainable models cannot mutate one another's weights or module tree.
+    """
+    def __init__(self, clip_model: CLIP):
+        super().__init__()
+        self.clip_model = copy.deepcopy(clip_model)
+        self.clip_model.requires_grad_(False)
+        self.register_buffer('text_features', None)
+        self.register_buffer('prompts', None)
+
+    @property
+    def image_encoder(self):
+        return self.clip_model.visual
+
+    @property
+    def dtype(self):
+        return self.clip_model.dtype
+
+    @property
+    def logit_scale(self):
+        return self.clip_model.logit_scale.exp()
+
+    def encode_text(self, text):
+        return self.clip_model.encode_text(text)
+
+    def encode_image(self, image):
+        return self.clip_model.encode_image(image)
+
+    @torch.no_grad()
+    def init_text_features(self, classnames, templates, tokenize, device):
+        if not isinstance(templates, list):
+            templates = [templates]
+        zeroshot_weights = []
+        for classname in classnames:
+            classname = classname.replace('_', ' ')
+            texts = tokenize([template.format(classname) for template in templates]).to(device)
+            class_embeddings = self.encode_text(texts)
+            class_embeddings = F.normalize(class_embeddings, dim=-1)
+            class_embedding = F.normalize(class_embeddings.mean(dim=0), dim=-1)
+            zeroshot_weights.append(class_embedding)
+        self.text_features = torch.stack(zeroshot_weights, dim=0)
+
+    def forward(self, image):
+        if self.text_features is None:
+            raise RuntimeError('Call init_text_features before zero-shot classification')
+        image_features = F.normalize(self.encode_image(image), dim=-1)
+        return self.logit_scale * image_features @ self.text_features.t()
+
+
+class MoRAM_CLIP(ZeroShotCLIP):
+    """LADA CLIP with only MoRAM factors trainable; no DPT/LADA/Text_Tuner.
+
+    forward(image) uses init_prompts or cached init_text_features;
+    forward(image, text=tokens) computes a fresh textual classifier.
+    All forward forms return a [batch, classes] logits tensor, like LADA.
+    """
+    def __init__(self, cfg, clip_model: CLIP):
+        super().__init__(clip_model)
+        apply_lora(self.clip_model, cfg)
+
+    @torch.no_grad()
+    def init_prompts(self, classnames, templates, tokenize, device):
+        if isinstance(templates, str):
+            templates = [templates]
+        self.prompts = tokenize([templates[0].format(name.replace('_', ' '))
+                                for name in classnames]).to(device)
+        self.text_features = None
+
+    def forward(self, image, text=None, text_features=None):
+        if text_features is None:
+            if text is not None:
+                text_features = self.encode_text(text)
+            elif self.prompts is not None:
+                text_features = self.encode_text(self.prompts)
+            elif self.text_features is not None:
+                text_features = self.text_features
+            else:
+                raise RuntimeError('Provide text, text_features, or call init_prompts/init_text_features')
+        image_features = F.normalize(self.encode_image(image), dim=-1)
+        text_features = F.normalize(text_features, dim=-1)
+        return self.logit_scale * image_features @ text_features.t()
+
+
+class LoRALayer():
+    def __init__(
+        self,
+        r: int,
+        lora_alpha: int,
+        lora_dropout: float,
+        merge_weights: bool,
+    ):
+        self.r = r
+        self.lora_alpha = lora_alpha
+        if lora_dropout > 0.:
+            self.lora_dropout = nn.Dropout(p=lora_dropout)
+        else:
+            self.lora_dropout = lambda x: x
+        self.merged = False
+        self.merge_weights = merge_weights
+
+
+class MoRAM_Linear(nn.Linear, LoRALayer):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        r: int = 0,
+        lora_alpha: int = 1,
+        lora_dropout: float = 0.,
+        fan_in_fan_out: bool = False,
+        merge_weights: bool = True,
+        module_name=None,
+        lora_threshold: float = 1.0,
+        temp: float = 0.01,
+        topk: Optional[int] = None,
+        **kwargs
+    ):
+        nn.Linear.__init__(self, in_features, out_features, **kwargs)
+        LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+                           merge_weights=merge_weights)
+
+        self.fan_in_fan_out = fan_in_fan_out
+
+        self.module_name = module_name
+        self.rank = r
+        self.init_rank = r
+        self.in_features = in_features
+        self.out_features = out_features
+        self.temp = float(temp)
+
+        self.lora_threshold = float(lora_threshold)
+        self.topk = int(topk) if topk is not None else r
+
+        if r > 0:
+            self.lora_A = nn.Parameter(self.weight.new_zeros((r, in_features)))
+            self.lora_B = nn.Parameter(self.weight.new_zeros((out_features, r)))
+            self.lora_scaling = 1
+            self.weight.requires_grad = False
+        else:
+            self.register_parameter("lora_A", None)
+            self.register_parameter("lora_B", None)
+        self.reset_parameters()
+        if fan_in_fan_out:
+            self.weight.data = self.weight.data.transpose(0, 1)
+
+        self.old_lora_A = None
+        self.old_lora_B = None
+        self.old_rank = 0
+
+    def reset_parameters(self):
+        nn.Linear.reset_parameters(self)
+        if getattr(self, 'lora_A', None) is not None:
+            nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B)
+
+    def set_old_rank(self, old_rank):
+        self.old_rank = old_rank
+
+    def increment_task(self):
+        if self.lora_A is not None:
+            if self.old_lora_A is not None:
+                self.old_lora_A = nn.Parameter(torch.cat([
+                    self.old_lora_A.data.clone(),
+                    self.lora_A.data.clone(),
+                ], dim=0))
+                self.old_lora_B = nn.Parameter(torch.cat([
+                    self.old_lora_B.data.clone(),
+                    self.lora_B.data.clone(),
+                ], dim=1))
+            else:
+                self.old_lora_A = nn.Parameter(self.lora_A.data.clone())
+                self.old_lora_B = nn.Parameter(self.lora_B.data.clone())
+
+            self.old_lora_A.requires_grad = False
+            self.old_lora_B.requires_grad = False
+
+            self.old_rank += self.rank
+
+        if self.init_rank > 0:
+            self.lora_A = nn.Parameter(self.weight.new_zeros((self.init_rank, self.in_features)))
+            self.lora_B = nn.Parameter(self.weight.new_zeros((self.out_features, self.init_rank)))
+            self.register_buffer("gate", torch.zeros(1, self.init_rank, device=self.weight.device, dtype=self.weight.dtype))
+            self.n_gate = 0
+            self.lora_scaling = 1
+            self.rank = self.init_rank
+            self.r = self.init_rank
+            nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B)
+            self.first_iter = True
+            
+    def forward(self, x: torch.Tensor, get_cur_feat=False, **kwargs):
+        def T(w):
+            return w.transpose(0, 1) if self.fan_in_fan_out else w
+
+        result = F.linear(x, T(self.weight), bias=self.bias)
+
+        if self.old_lora_A is None and self.lora_A is None:
+            return result, 0
+
+        if self.old_lora_A is not None and self.lora_A is not None:
+            combined_lora_A = torch.cat([self.old_lora_A, self.lora_A], dim=0)
+            B_combined = torch.cat(
+                [self.old_lora_B, self.lora_B * self.lora_scaling], dim=1
+            )
+        elif self.old_lora_A is not None:
+            combined_lora_A = self.old_lora_A
+            B_combined = self.old_lora_B
+        elif self.lora_A is not None:
+            combined_lora_A = self.lora_A
+            B_combined = self.lora_B * self.lora_scaling
+        else:
+            return result, 0
+
+        xd = self.lora_dropout(x)
+        projection = xd @ combined_lora_A.T
+
+        normed_projection = F.normalize(projection, p=2, dim=-1)
+
+        k = min(max(self.topk, 2), normed_projection.shape[-1])
+        topk_values, topk_indices = torch.topk(normed_projection, k=k, dim=-1)
+        masked_logits = torch.full_like(normed_projection, float('-inf'))
+        masked_logits.scatter_(-1, topk_indices, topk_values)
+        weights = F.softmax(masked_logits / self.temp, dim=-1)
+
+        if not self.training and self.lora_threshold > 0:
+            gate_mask = (normed_projection >= self.lora_threshold).float()
+            weights = weights * gate_mask
+
+        weighted_proj = projection * weights
+        lora_delta = torch.matmul(weighted_proj, B_combined.T)
+
+        result = result + lora_delta
+
+        loss = 0
+
+        return result, loss
+
+
 
 class PlainMultiheadAttentionLoRA(nn.Module):
 
@@ -56,25 +301,25 @@ class PlainMultiheadAttentionLoRA(nn.Module):
         """
         lora_kwargs = {'temp': self.lora_temp, 'lora_threshold': self.lora_threshold, 'topk': self.lora_topk}
         if 'q' in enable_lora:
-            lora_q_proj = lora.MoRAM_Linear(self.q_proj.in_features, self.q_proj.out_features, r=r, module_name=self.module_name + '.q_proj', **lora_kwargs)
+            lora_q_proj = MoRAM_Linear(self.q_proj.in_features, self.q_proj.out_features, r=r, module_name=self.module_name + '.q_proj', **lora_kwargs)
             lora_q_proj.weight.data.copy_(self.q_proj.weight.data)
             if self.q_proj.bias is not None:
                 lora_q_proj.bias.data.copy_(self.q_proj.bias.data)
             self.q_proj = lora_q_proj
         if 'k' in enable_lora:
-            lora_k_proj = lora.MoRAM_Linear(self.k_proj.in_features, self.k_proj.out_features, r=r, module_name=self.module_name + '.k_proj', **lora_kwargs)
+            lora_k_proj = MoRAM_Linear(self.k_proj.in_features, self.k_proj.out_features, r=r, module_name=self.module_name + '.k_proj', **lora_kwargs)
             lora_k_proj.weight.data.copy_(self.k_proj.weight.data)
             if self.k_proj.bias is not None:
                 lora_k_proj.bias.data.copy_(self.k_proj.bias.data)
             self.k_proj = lora_k_proj
         if 'v' in enable_lora:
-            lora_v_proj = lora.MoRAM_Linear(self.v_proj.in_features, self.v_proj.out_features, r=r, module_name=self.module_name + '.v_proj', **lora_kwargs)
+            lora_v_proj = MoRAM_Linear(self.v_proj.in_features, self.v_proj.out_features, r=r, module_name=self.module_name + '.v_proj', **lora_kwargs)
             lora_v_proj.weight.data.copy_(self.v_proj.weight.data)
             if self.v_proj.bias is not None:
                 lora_v_proj.bias.data.copy_(self.v_proj.bias.data)
             self.v_proj = lora_v_proj
         if 'o' in enable_lora:
-            lora_out_proj = lora.MoRAM_Linear(self.out_proj.in_features, self.out_proj.out_features, r=r, module_name=self.module_name + '.out_proj', **lora_kwargs)
+            lora_out_proj = MoRAM_Linear(self.out_proj.in_features, self.out_proj.out_features, r=r, module_name=self.module_name + '.out_proj', **lora_kwargs)
             lora_out_proj.weight.data.copy_(self.out_proj.weight.data)
             if self.out_proj.bias is not None:
                 lora_out_proj.bias.data.copy_(self.out_proj.bias.data)
@@ -111,17 +356,17 @@ class PlainMultiheadAttentionLoRA(nn.Module):
         else:
             head_dim = embed_dim // num_heads
         assert head_dim * num_heads == embed_dim, f'embed_dim {embed_dim} not divisible by num_heads {num_heads}'
-        if isinstance(self.q_proj, lora.MoRAM_Linear):
+        if isinstance(self.q_proj, MoRAM_Linear):
             q, prename_loss = self.q_proj(query, reg_prename=reg_prename, get_cur_feat=get_cur_feat)
             losses.append(prename_loss)
         else:
             q = self.q_proj(query)
-        if isinstance(self.k_proj, lora.MoRAM_Linear):
+        if isinstance(self.k_proj, MoRAM_Linear):
             k, prename_loss = self.k_proj(key, reg_prename=reg_prename, get_cur_feat=get_cur_feat)
             losses.append(prename_loss)
         else:
             k = self.k_proj(key)
-        if isinstance(self.v_proj, lora.MoRAM_Linear):
+        if isinstance(self.v_proj, MoRAM_Linear):
             v, prename_loss = self.v_proj(value, reg_prename=reg_prename, get_cur_feat=get_cur_feat)
             losses.append(prename_loss)
         else:
@@ -139,7 +384,7 @@ class PlainMultiheadAttentionLoRA(nn.Module):
         v = v.view(bsz, num_heads, source_len, head_dim)
         attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask, dropout_p, is_causal)
         attn_output = attn_output.permute(2, 0, 1, 3).contiguous().view(bsz * tgt_len, embed_dim)
-        if isinstance(self.out_proj, lora.MoRAM_Linear):
+        if isinstance(self.out_proj, MoRAM_Linear):
             attn_output, prename_loss = self.out_proj(attn_output, reg_prename=reg_prename, get_cur_feat=get_cur_feat)
             losses.append(prename_loss)
         else:
@@ -158,7 +403,7 @@ class PlainMultiheadAttentionLoRA(nn.Module):
         return super().train(mode)
 
 
-class MoRAMLinearTensor(lora.MoRAM_Linear):
+class MoRAMLinearTensor(MoRAM_Linear):
     """Let LADA's original nn.Sequential MLP receive a tensor, not a tuple.
 
     The active upstream MoRAM implementation always returns regularization 0.
@@ -198,7 +443,7 @@ def apply_lora(model, cfg):
     if target in ('text', 'all'):
         transformers.append(('', model.transformer))
     # Reject repeated injection before mutating anything.
-    if any(isinstance(m, (lora.MoRAM_Linear, PlainMultiheadAttentionLoRA)) for m in model.modules()):
+    if any(isinstance(m, (MoRAM_Linear, PlainMultiheadAttentionLoRA)) for m in model.modules()):
         raise ValueError('MoRAM is already injected')
     for prefix, transformer in transformers:
         for i, block in enumerate(transformer.resblocks):
@@ -233,6 +478,6 @@ def increment_task(model):
     Recreate the optimizer after this call: new Parameters replace old ones.
     """
     for module in model.modules():
-        if isinstance(module, lora.MoRAM_Linear):
+        if isinstance(module, MoRAM_Linear):
             module.increment_task()
     return mark_only_moram_trainable(model)

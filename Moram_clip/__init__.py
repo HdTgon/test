@@ -2,15 +2,16 @@
 import logging
 import torch
 from .clip import clip
-from .injection import apply_lora, increment_task, mark_only_moram_trainable
-from .moram_lora import MoRAM_Linear
+from .models import (ZeroShotCLIP, MoRAM_CLIP, MoRAM_Linear,
+                     PlainMultiheadAttentionLoRA, apply_lora, increment_task,
+                     mark_only_moram_trainable)
 
 
 def get_moram(cfg, zero_shot=False):
     """Return (LADA CLIP, train_transform, test_transform, tokenizer).
 
     zero_shot=True: original frozen CLIP; False: only current MoRAM factors train.
-    Both retain LADA's tensor encoders and (image_logits, text_logits) forward.
+    Both return feature tensors; wrapper forward returns classification logits.
     """
     name = cfg.get('backbone_type', 'ViT-B/16').removeprefix('CLIP-')
     name = {'ViT-B-16':'ViT-B/16', 'ViT-B-32':'ViT-B/32',
@@ -27,13 +28,13 @@ def get_moram(cfg, zero_shot=False):
     else:
         model.float()
     if zero_shot:
-        model.requires_grad_(False)
+        model = ZeroShotCLIP(model)
     else:
-        apply_lora(model, cfg)
+        model = MoRAM_CLIP(cfg, model)
     device = cfg.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device).eval()
     logging.info('LADA CLIP + MoRAM: backbone=%s precision=%s zero_shot=%s',name,prec,zero_shot)
     return model, preprocess, preprocess, clip.tokenize
 
 
-__all__ = ['get_moram', 'apply_lora', 'increment_task', 'MoRAM_Linear', 'clip', 'mark_only_moram_trainable']
+__all__ = ['ZeroShotCLIP', 'MoRAM_CLIP', 'PlainMultiheadAttentionLoRA', 'get_moram', 'apply_lora', 'increment_task', 'MoRAM_Linear', 'clip', 'mark_only_moram_trainable']
