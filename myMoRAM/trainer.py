@@ -2,6 +2,7 @@ import os
 import time
 import datetime
 import math
+import hashlib
 from tqdm import tqdm
 
 import torch
@@ -74,6 +75,9 @@ class Trainer:
         self.seen_prompts = []
         self.completed_tasks = 0
         self.text_prototypes = None
+        self.image_prototypes = None
+        self.zero_shot_text_prototypes = None
+        self.prototype_counts = None
         self.build_data_loader()
         self.build_model()
         self.evaluator = Evaluator(cfg)
@@ -153,6 +157,8 @@ class Trainer:
                 increment_task(self.model)
             self.total_num_classes = self.num_classes + len(self.seen_prompts)
             self.model.init_prompts(self.classnames, ['a photo of a {}.'], clip.tokenize, self.device)
+            self.current_zero_shot_prototypes = self.load_or_extract_zero_shot_prototypes(
+                cfg.zero_shot_prototype_dir or cfg.output_dir)
             self.build_optimizer()
             self.build_criterion()
             torch.cuda.empty_cache()
@@ -241,6 +247,12 @@ class Trainer:
             features = self.model.encode_text(self.model.prompts)
             self.text_prototypes = torch.cat((self.text_prototypes, features), dim=0) if self.text_prototypes is not None else features
         self.seen_prompts += ['a photo of a {}.'.format(name.replace('_', ' ')) for name in self.classnames]
+        for attribute, key in [('image_prototypes', 'image_prototypes'),
+                               ('zero_shot_text_prototypes', 'text_prototypes'),
+                               ('prototype_counts', 'counts')]:
+            current = self.current_zero_shot_prototypes[key].to(self.device)
+            previous = getattr(self, attribute)
+            setattr(self, attribute, torch.cat((previous, current), dim=0) if previous is not None else current)
         self.completed_tasks += 1
         self.save_model(cfg.output_dir)
         self.test_cur_task()
@@ -416,11 +428,74 @@ class Trainer:
         return results
 
     @torch.no_grad()
+    def load_or_extract_zero_shot_prototypes(self, directory, force=False):
+        """Cache frozen CLIP class centroids from the deterministic training split.
+
+        One normalized mean image embedding and one frozen text embedding per
+        class. These are reference data only; no replay/GMM/LADA loss is added.
+        """
+        cfg = self.cfg
+        digest = hashlib.sha256()
+        for name, value in self.clip_model.state_dict().items():
+            digest.update(name.encode())
+            digest.update(value.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
+        samples = hashlib.sha256()
+        for item in self.train_loader4updating.dataset.data_source:
+            samples.update(str(item.label).encode())
+            if isinstance(item.impath, str):
+                stat = os.stat(item.impath)
+                samples.update(f'{os.path.realpath(item.impath)}:{stat.st_size}:{stat.st_mtime_ns}'.encode())
+            else:
+                samples.update(item.impath.tobytes())
+        metadata = dict(version=1, dataset=cfg.dataset, classnames=list(self.classnames),
+                        root=os.path.realpath(cfg.root), num_shots=cfg.num_shots,
+                        resolution=cfg.resolution, backbone_sha256=digest.hexdigest(),
+                        samples_sha256=samples.hexdigest(), template='a photo of a {}.',
+                        normalization='mean_of_unit_image_features_then_unit_normalize')
+        cache_dir = os.path.join(directory, 'zero_shot_prototypes')
+        cache_path = os.path.join(cache_dir, cfg.dataset + '.pth')
+        if os.path.isfile(cache_path) and not force:
+            cached = torch.load(cache_path, map_location='cpu', weights_only=True)
+            if cached.get('metadata') == metadata:
+                print(f'Loaded zero-shot class prototypes from {cache_path}')
+                return cached
+            print('Zero-shot prototype metadata changed; recomputing')
+        rng_state = torch.get_rng_state()
+        reference = self.clip_model.to(self.device).eval()
+        try:
+            sums = torch.zeros(self.num_classes, reference.visual.output_dim, device=self.device)
+            counts = torch.zeros(self.num_classes, dtype=torch.long, device=self.device)
+            for image, label in tqdm(self.train_loader4updating, desc='Zero-shot class prototypes', ascii=True):
+                label = label.to(self.device)
+                features = F.normalize(reference.encode_image(image.to(self.device)).float(), dim=-1)
+                sums.index_add_(0, label, features)
+                counts.index_add_(0, label, torch.ones_like(label))
+            if (counts == 0).any():
+                raise ValueError('Cannot extract a prototype for a class with no training samples')
+            image_prototypes = F.normalize(sums / counts[:, None], dim=-1)
+            if (image_prototypes.norm(dim=-1) == 0).any():
+                raise ValueError('A zero-shot class mean is zero')
+            prompts = ['a photo of a {}.'.format(name.replace('_', ' ')) for name in self.classnames]
+            text_prototypes = F.normalize(reference.encode_text(clip.tokenize(prompts).to(self.device)).float(), dim=-1)
+            cached = dict(metadata=metadata, image_prototypes=image_prototypes.cpu(),
+                          text_prototypes=text_prototypes.cpu(), counts=counts.cpu())
+        finally:
+            reference.cpu()
+            torch.set_rng_state(rng_state)
+        os.makedirs(cache_dir, exist_ok=True)
+        torch.save(cached, cache_path)
+        print(f'Saved zero-shot class prototypes to {cache_path}')
+        return cached
+
+    @torch.no_grad()
     def save_model(self, directory):
         checkpoint = {
             'model': {name: value for name, value in self.model.state_dict().items()
                       if name not in ('prompts', 'text_features')},
             'text_prototypes': self.text_prototypes,
+            'image_prototypes': self.image_prototypes,
+            'zero_shot_text_prototypes': self.zero_shot_text_prototypes,
+            'prototype_counts': self.prototype_counts,
             'seen_prompts': self.seen_prompts,
             'completed_tasks': self.completed_tasks,
             'config': dict(self.cfg),
@@ -448,5 +523,10 @@ class Trainer:
             increment_task(self.model)
         self.model.load_state_dict(checkpoint['model'], strict=True)
         self.text_prototypes = checkpoint['text_prototypes'].to(self.device)
+        for key in ('image_prototypes', 'zero_shot_text_prototypes', 'prototype_counts'):
+            value = checkpoint.get(key)
+            if value is None:
+                raise ValueError('Checkpoint lacks zero-shot prototypes; restart from the first task')
+            setattr(self, key, value.to(self.device))
         self.seen_prompts = checkpoint['seen_prompts']
         self.completed_tasks = completed

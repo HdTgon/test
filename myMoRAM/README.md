@@ -107,3 +107,30 @@ Trainer 的方法集合与 LADA 原版完全相同，没有另建 current_loader
 - `save_model` / `load_model4CL`：同名、同 checkpoint 路径，内容替换为 MoRAM 模型/历史因子与文本缓存。不兼容上一版开发中的 checkpoint 格式，需重新开始实验。
 
 重新使用原 LADA `utils/evaluator.py`；只给 task selection precision 的零分母增加保护，未改变有预测样本时的计算。checkpoint 保持任务边界恢复，不额外承诺恢复随机状态或迭代中间恢复。
+
+## Zero-shot 类别原型缓存
+
+`Trainer.load_or_extract_zero_shot_prototypes(directory, force=False)` 在构建训练模型时自动调用。它使用**未注入 LoRA 的原始 CLIP**，从 `train_loader4updating` 提取特征（训练 split、确定性 test transform，不读取测试集图像作为训练原型）。
+
+默认缓存文件：`output/<run>/zero_shot_prototypes/<dataset>.pth`。可设置 `zero_shot_prototype_dir /path/to/cache` 来跨实验共享，实际文件位于该目录的 `zero_shot_prototypes/` 下。
+
+每类图像先做单位归一化，再按类别求均值，最后再归一化，得到 `[num_classes, embedding_dim]` 的视觉原型。缓存内容为：
+
+- `image_prototypes`：上述 frozen zero-shot 视觉原型。
+- `text_prototypes`：冻结 CLIP 使用统一类别模板的单位文本原型。
+- `counts`：每类样本数量。
+- `metadata`：类别排列、样本来源、权重摘要、分辨率等，用于检查缓存是否匹配。
+
+每次先读缓存，匹配则不再跑视觉编码；不匹配时重新提取。需要手动重提取可调用：
+
+```python
+trainer.load_or_extract_zero_shot_prototypes(cfg.output_dir, force=True)
+```
+
+提取会恢复 CPU 随机状态，避免“命中缓存/重新提取”改变后续训练的 shuffle 随机序列。视觉原型来自 few-shot 设置选中的训练样本，不是 GMM 中心；不生成无意义的 covariance、lada_features 或 classifier。
+
+`save_model/load_model4CL` 同步保存/恢复累计的 `image_prototypes`、`zero_shot_text_prototypes`、`prototype_counts`，顺序与已完成任务及其 classnames 一致。checkpoint 的 `text_prototypes` 仍为 LADA 评估流程使用的**训练后文本缓存**，与冻结参考文本原型分开。
+
+这些 zero-shot 原型仅作为对照保存，不参与 MoRAM replay 或损失；模型 checkpoint 仍需保存实际 LoRA 和历史因子，保证持续学习。没有这些原型字段的旧开发 checkpoint 需要从第一任务重新开始。
+
+现有 5 项 CPU 测试通过，新增验证缓存命中不做图像编码、手工均值结果一致、强制重算、元数据变化失效、随机状态恢复，以及两任务原型累计与 checkpoint 加载。
