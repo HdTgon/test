@@ -1,0 +1,13 @@
+backbone: "CLIP-ViT-B/16"
+prec: "fp32"
+iterations: 1000
+lr: 0.001
+wd: 0.0
+ls: 0.0
+warmup_length: 0
+target_encoder: "all"
+target_modules: ["q_proj", "v_proj"]
+rank: 4
+topk: 4
+temp: 0.01
+prune_thre: 1.0
