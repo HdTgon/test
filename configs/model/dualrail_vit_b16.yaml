@@ -1,0 +1,21 @@
+algorithm: "DualRAIL"
+backbone: "CLIP-ViT-B/16"
+resolution: 224
+num_shots: 16
+
+output_dir: null
+print_freq: 10
+seed: 0
+deterministic: True
+gpu: 0
+num_workers: 8
+prec: "amp"
+continue_train: True
+continue_train_first: False
+batch_size: 64
+
+# Reference dual_RAIL.py uses a Gaussian kernel, with no random expansion.
+gamma: 0.1
+dual_regularization: 0.001
+fusion_weight: 0.8
+augmentation_time: 1

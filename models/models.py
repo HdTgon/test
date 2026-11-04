@@ -177,3 +177,90 @@ class RAILCLIP(ZeroShotCLIP):
             clip_weights = self.text_features.t()
         # The reference RAIL fusion uses a fixed CLIP temperature of 100.
         return 100.0 * self.encode_images(images) @ clip_weights
+
+
+class DualRAILCLIP(ZeroShotCLIP):
+    """Reference dual RAIL: frozen CLIP features + Gaussian kernel regression.
+
+    All training features and global integer targets are retained across tasks.
+    Each task refits alpha on their joint kernel, without feature expansion.
+    """
+    def __init__(self, cfg, clip_model: CLIP):
+        super().__init__(clip_model)
+        self.feature_dim = clip_model.text_projection.shape[1]
+        self.gamma = cfg.gamma
+        self.regularization = cfg.dual_regularization
+        if self.gamma <= 0 or self.regularization <= 0:
+            raise ValueError('gamma and dual_regularization must be positive')
+        device = clip_model.text_projection.device
+        self.register_buffer('feature_memory', torch.empty(0, self.feature_dim, device=device))
+        self.register_buffer('target_memory', torch.empty(0, device=device, dtype=torch.long))
+        self.register_buffer('alpha', None)
+        self.clip_model.requires_grad_(False)
+        self.clip_model.eval()
+
+    @property
+    def num_classes(self):
+        return 0 if self.alpha is None else self.alpha.shape[1]
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.clip_model.eval()
+        return self
+
+    @torch.no_grad()
+    def encode_images(self, images):
+        return F.normalize(self.encode_image(images), dim=-1)
+
+    @torch.no_grad()
+    def analytic_adaption(self, task_id, cfg, train_loader):
+        from utils.rail import fit_kernel_ridge
+
+        if task_id < 0:
+            raise ValueError('task_id must be nonnegative')
+        previous = 0 if task_id == 0 else int(cfg.trained_class_num)
+        num_classes = int(cfg.current_class_num)
+        if num_classes <= previous:
+            raise ValueError('current_class_num must exceed trained_class_num')
+        if task_id > 0 and self.num_classes != previous:
+            raise ValueError('Previous classifier does not match trained_class_num')
+        device = self.clip_model.text_projection.device
+        self.clip_model.eval()
+        all_features, all_targets = [], []
+        for images, targets in train_loader:
+            targets = targets.to(device=device, dtype=torch.long) + previous
+            if targets.numel() == 0:
+                continue
+            if targets.min() < previous or targets.max() >= num_classes:
+                raise ValueError('Expected task-local labels in the current task class range')
+            all_features.append(self.encode_images(images.to(device)).float())
+            all_targets.append(targets)
+        if not all_features:
+            raise ValueError('train_loader must contain training samples')
+        features = torch.cat(all_features)
+        targets = torch.cat(all_targets)
+        if task_id > 0:
+            features = torch.cat((self.feature_memory, features))
+            targets = torch.cat((self.target_memory, targets))
+        labels = F.one_hot(targets, num_classes).float()
+        alpha = fit_kernel_ridge(features, labels, self.regularization, self.gamma)
+        self.feature_memory = features
+        self.target_memory = targets
+        self.alpha = alpha
+        return alpha
+
+    def forward(self, images):
+        from utils.rail import gaussian_kernel
+
+        if self.alpha is None:
+            raise RuntimeError('Call analytic_adaption before analytic inference')
+        features = self.encode_images(images).float()
+        kernel = gaussian_kernel(features, self.feature_memory, self.gamma)
+        return (kernel.to(self.alpha.dtype) @ self.alpha).float()
+
+    def zero_shot(self, images, clip_weights=None):
+        if clip_weights is None:
+            if self.text_features is None:
+                raise RuntimeError('Call init_text_features before zero-shot inference')
+            clip_weights = self.text_features.t()
+        return 100.0 * self.encode_images(images) @ clip_weights

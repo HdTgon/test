@@ -1,3 +1,4 @@
+algorithm: "RAIL"
 backbone: "CLIP-ViT-B/16"
 resolution: 224
 num_shots: 16

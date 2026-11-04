@@ -2,7 +2,7 @@
 
 This is the source code for our paper "LADA: Scalable Label-Specific CLIP Adapter for Continual Learning" which has been accepted to **ICML 2025**.
 
-> This fork uses primal RAIL for training and inference. The original LADA
+> This fork supports primal RAIL and DualRAIL for training and inference. The original LADA
 > dataset loaders, preprocessing, task order, CLI, and result-log format are retained.
 > Algorithm reference: [Regression-based Analytic Incremental Learning](https://github.com/linghan1997/Regression-based-Analytic-Incremental-Learning).
 >
@@ -50,6 +50,40 @@ Run CPU regression tests without downloading datasets or pretrained weights:
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+## Selecting RAIL or DualRAIL
+
+`main.py` selects `rail_trainer.py` for `algorithm RAIL` (the default), or
+`dualrail_trainer.py` for `algorithm DualRAIL`. Names are case-insensitive.
+`zero_shot True` always uses `rail_trainer.py`'s zero-shot evaluation, regardless
+of the algorithm name. Each trainer retains its own explicit training and
+inference loops; dataset loading and image transforms are unchanged.
+
+For DualRAIL, use `-m dualrail_vit_b16`:
+
+```bash
+CUDA_VISIBLE_DEVICES=6 python main.py -d TAIL -m dualrail_vit_b16 root /path/to/datasets dataset aircraft continue_train_first True output_dir DualRAIL_16shot
+CUDA_VISIBLE_DEVICES=6 python main.py -d TAIL -m dualrail_vit_b16 root /path/to/datasets dataset caltech101 output_dir DualRAIL_16shot
+```
+
+Alternatively append `algorithm DualRAIL` to an existing command. The original
+scripts keep their RAIL settings and visible GPU selection. Use separate output
+directories for the two algorithms; their checkpoints are not interchangeable.
+
+DualRAIL follows the reference `dual_RAIL.py` and Gaussian KRR in `utils.py`:
+normalized frozen CLIP image embeddings are accumulated across tasks, then the
+joint system `(K + dual_regularization * I) alpha = one_hot_labels` is solved.
+The kernel is `exp(-gamma * squared_distance)`. Defaults are `gamma: 0.1`,
+`dual_regularization: 0.001`, and `fusion_weight: 0.8`; primal `regularization`,
+`hidden_dim`, and `feature_expansion` do not affect DualRAIL. Its inference uses
+the same zero-shot selection and score fusion as RAIL.
+
+Dual checkpoints contain feature memory, integer label memory, `alpha`, task
+ordering and kernel hyperparameters, with no CLIP weights. Later tasks restore
+all historical features before refitting. This reference algorithm retains all
+training embeddings: kernel memory grows quadratically with the accumulated
+sample count, and solving the joint kernel grows cubically. In particular,
+full-shot runs require substantially more resources than few-shot runs.
 
 ## Requirements
 

@@ -17,7 +17,7 @@ from torch.nn import functional as F
 from clip.model import CLIP
 from models.models import RAILCLIP
 from scenario_datasets.utils import Datum
-from trainer import Trainer
+from rail_trainer import Trainer
 from utils.config import _C
 
 
@@ -144,7 +144,7 @@ class RAILTests(unittest.TestCase):
         registry = {'first': dataset_type(['cat', 'dog']), 'second': dataset_type(['bird'])}
         with tempfile.TemporaryDirectory() as directory, \
              patch('scenario_datasets.build_functions.dataset_list', registry), \
-             patch('trainer.load_clip_to_cpu', side_effect=lambda *args: copy.deepcopy(base)), \
+             patch('rail_trainer.load_clip_to_cpu', side_effect=lambda *args: copy.deepcopy(base)), \
              contextlib.redirect_stdout(io.StringIO()):
             cfg = _C.clone()
             cfg.merge_from_file('configs/model/clip_vit_b16.yaml')
@@ -190,7 +190,7 @@ class RAILTests(unittest.TestCase):
     def test_zero_shot_original_entry(self):
         registry = {'first': dataset_type(['cat', 'dog'])}
         with patch('scenario_datasets.build_functions.dataset_list', registry), \
-             patch('trainer.load_clip_to_cpu', return_value=tiny_clip()), \
+             patch('rail_trainer.load_clip_to_cpu', return_value=tiny_clip()), \
              contextlib.redirect_stdout(io.StringIO()):
             cfg = _C.clone()
             cfg.merge_from_file('configs/model/zs_clip_vit_b16.yaml')

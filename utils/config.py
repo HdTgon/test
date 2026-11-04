@@ -58,3 +58,8 @@ _C.hidden_dim = 15000
 _C.regularization = 0.1
 _C.fusion_weight = 0.8
 _C.augmentation_time = 1
+
+# Algorithm routing and reference dual-space RAIL hyperparameters.
+_C.algorithm = "RAIL"
+_C.gamma = 0.1
+_C.dual_regularization = 0.001

@@ -7,7 +7,6 @@ import numpy as np
 from utils.config import _C as cfg
 from utils.logger import setup_logger
 
-from trainer import Trainer
 
 
 def main(args):
@@ -51,6 +50,14 @@ def main(args):
     else:
         torch.backends.cudnn.deterministic = False
         torch.backends.cudnn.benchmark = True
+
+    # Zero-shot always uses the RAIL trainer, regardless of algorithm.
+    if cfg.zero_shot or cfg.algorithm.lower() == "rail":
+        from rail_trainer import Trainer
+    elif cfg.algorithm.lower() == "dualrail":
+        from dualrail_trainer import Trainer
+    else:
+        raise ValueError(f"Unknown algorithm: {cfg.algorithm}. Use RAIL or DualRAIL.")
 
     trainer = Trainer(cfg)
     
