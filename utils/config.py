@@ -62,4 +62,3 @@ _C.augmentation_time = 1
 # Algorithm routing and reference dual-space RAIL hyperparameters.
 _C.algorithm = "RAIL"
 _C.gamma = 0.1
-_C.dual_regularization = 0.001

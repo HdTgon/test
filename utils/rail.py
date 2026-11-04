@@ -24,7 +24,7 @@ def gaussian_kernel(x, centers, gamma, chunk_size=32):
 @torch.no_grad()
 def fit_kernel_ridge(features, labels, regularization, gamma):
     if regularization <= 0:
-        raise ValueError('dual_regularization must be positive')
+        raise ValueError('regularization must be positive')
     # The reference uses NumPy's float64 solve after computing a float32
     # Gaussian kernel. Keep that precision, without np.mat or explicit inverse.
     kernel = gaussian_kernel(features, features, gamma).double()

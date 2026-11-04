@@ -189,9 +189,9 @@ class DualRAILCLIP(ZeroShotCLIP):
         super().__init__(clip_model)
         self.feature_dim = clip_model.text_projection.shape[1]
         self.gamma = cfg.gamma
-        self.regularization = cfg.dual_regularization
+        self.regularization = cfg.regularization
         if self.gamma <= 0 or self.regularization <= 0:
-            raise ValueError('gamma and dual_regularization must be positive')
+            raise ValueError('gamma and regularization must be positive')
         device = clip_model.text_projection.device
         self.register_buffer('feature_memory', torch.empty(0, self.feature_dim, device=device))
         self.register_buffer('target_memory', torch.empty(0, device=device, dtype=torch.long))

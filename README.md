@@ -59,23 +59,30 @@ python -m unittest discover -s tests -v
 of the algorithm name. Each trainer retains its own explicit training and
 inference loops; dataset loading and image transforms are unchanged.
 
-For DualRAIL, use `-m dualrail_vit_b16`:
+Both algorithms use `-m clip_vit_b16` and the same configuration, following
+`configs/analytic_clip.yaml` in the reference: `seed: 42`, `batch_size: 128`,
+`regularization: 0.1`, `gamma: 0.1`, `fusion_weight: 0.8`,
+`feature_expansion: True`, `hidden_dim: 15000`, `augmentation_time: 1`.
+Select the algorithm in the command, for example:
 
 ```bash
-CUDA_VISIBLE_DEVICES=6 python main.py -d TAIL -m dualrail_vit_b16 root /path/to/datasets dataset aircraft continue_train_first True output_dir DualRAIL_16shot
-CUDA_VISIBLE_DEVICES=6 python main.py -d TAIL -m dualrail_vit_b16 root /path/to/datasets dataset caltech101 output_dir DualRAIL_16shot
+CUDA_VISIBLE_DEVICES=6 python main.py -d TAIL -m clip_vit_b16 algorithm RAIL root /path/to/datasets dataset aircraft continue_train_first True output_dir RAIL_TAIL_16shot
+CUDA_VISIBLE_DEVICES=6 python main.py -d TAIL -m clip_vit_b16 algorithm DualRAIL root /path/to/datasets dataset aircraft continue_train_first True output_dir DualRAIL_TAIL_16shot
 ```
 
-Alternatively append `algorithm DualRAIL` to an existing command. The original
-scripts keep their RAIL settings and visible GPU selection. Use separate output
-directories for the two algorithms; their checkpoints are not interchangeable.
+The four 16-shot scripts below select their algorithm explicitly, share the same
+model configuration, and write to separate algorithm/order output directories.
+Each keeps `CUDA_VISIBLE_DEVICES=6` at the top for server GPU selection.
+Full-shot scripts have been removed. Checkpoints are not interchangeable
+between the two algorithms. Earlier DualRAIL runs using regularization 0.001
+must resume with `regularization 0.001`, or start a new run with shared defaults.
 
 DualRAIL follows the reference `dual_RAIL.py` and Gaussian KRR in `utils.py`:
 normalized frozen CLIP image embeddings are accumulated across tasks, then the
-joint system `(K + dual_regularization * I) alpha = one_hot_labels` is solved.
+joint system `(K + regularization * I) alpha = one_hot_labels` is solved.
 The kernel is `exp(-gamma * squared_distance)`. Defaults are `gamma: 0.1`,
-`dual_regularization: 0.001`, and `fusion_weight: 0.8`; primal `regularization`,
-`hidden_dim`, and `feature_expansion` do not affect DualRAIL. Its inference uses
+`regularization: 0.1`, and `fusion_weight: 0.8`;
+`hidden_dim` and `feature_expansion` do not affect DualRAIL. Its inference uses
 the same zero-shot selection and score fusion as RAIL.
 
 Dual checkpoints contain feature memory, integer label memory, `alpha`, task
@@ -167,17 +174,13 @@ Path/To/Dataset/Folder
 To run this fork's RAIL pipeline with the original dataset/task scripts, run
 
 ```bash
-# run RAIL on 16-shot order-I setting
-bash scripts/run_TAIL_16shot.sh
+# RAIL, order I / II
+bash scripts/run_RAIL_TAIL_16shot.sh
+bash scripts/run_RAIL_TAIL_16shot_order2.sh
 
-# run RAIL on 16-shot order-II setting
-bash scripts/run_TAIL_16shot_order2.sh
-
-# run RAIL on full-shot order-I setting
-bash scripts/run_TAIL_fullshot.sh
-
-# run RAIL on full-shot order-II setting
-bash scripts/run_TAIL_fullshot_order2.sh
+# DualRAIL, order I / II
+bash scripts/run_DualRAIL_TAIL_16shot.sh
+bash scripts/run_DualRAIL_TAIL_16shot_order2.sh
 ```
 
 Each script will **automatically run the full experimental pipeline**, including training and evaluation, and **output the final accuracy metrics**.

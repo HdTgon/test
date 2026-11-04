@@ -139,7 +139,7 @@ class Trainer:
         task_cfg = SimpleNamespace(
             current_class_num=self.total_num_classes,
             trained_class_num=self.previous_num_classes,
-            regularization=cfg.dual_regularization,
+            regularization=cfg.regularization,
         )
 
         def training_batches():

@@ -29,7 +29,7 @@ class DualRAILTests(unittest.TestCase):
         torch.manual_seed(23)
 
     def test_dual_matches_reference_after_two_tasks(self):
-        cfg = SimpleNamespace(gamma=0.1, dual_regularization=0.001,
+        cfg = SimpleNamespace(gamma=0.1, regularization=0.1,
                               current_class_num=2, trained_class_num=0)
         model = DualRAILCLIP(cfg, tiny_clip())
         x = torch.randn(9, 3, 8, 8)
@@ -48,7 +48,7 @@ class DualRAILTests(unittest.TestCase):
         y = F.one_hot(global_labels, 3).float().numpy()
         # Independent translation of the reference utils.py equations.
         kernel = torch.exp(-cfg.gamma * (features[:, None] - features[None, :]).square().sum(-1)).numpy()
-        alpha = np.linalg.solve(kernel + cfg.dual_regularization * np.eye(9), y)
+        alpha = np.linalg.solve(kernel + cfg.regularization * np.eye(9), y)
         np.testing.assert_allclose(model.alpha.numpy(), alpha, atol=1e-8, rtol=1e-8)
         query_kernel = torch.exp(-cfg.gamma * (query_features[:, None] - features[None, :]).square().sum(-1)).numpy()
         np.testing.assert_allclose(model(x).numpy(), query_kernel @ alpha, atol=2e-6, rtol=2e-6)
@@ -75,7 +75,8 @@ class DualRAILTests(unittest.TestCase):
              patch('dualrail_trainer.load_clip_to_cpu', side_effect=lambda *args: copy.deepcopy(base)), \
              contextlib.redirect_stdout(io.StringIO()):
             cfg = _C.clone()
-            cfg.merge_from_file('configs/model/dualrail_vit_b16.yaml')
+            cfg.merge_from_file('configs/model/clip_vit_b16.yaml')
+            cfg.algorithm = 'DualRAIL'
             cfg.dataset_sequence = ['first', 'second']
             cfg.dataset = 'first'
             cfg.resolution = 8
