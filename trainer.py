@@ -1,5 +1,6 @@
 import os
 import time
+import datetime
 from types import SimpleNamespace
 
 import torch
@@ -31,13 +32,15 @@ def load_clip_to_cpu(backbone_name, prec):
 
 class Trainer:
     def __init__(self, cfg):
+
         if not torch.cuda.is_available():
             self.device = torch.device("cpu")
         elif cfg.gpu is None:
             self.device = torch.device("cuda")
         else:
             torch.cuda.set_device(cfg.gpu)
-            self.device = torch.device(f"cuda:{cfg.gpu}")
+            self.device = torch.device("cuda:{}".format(cfg.gpu))
+
         self.cfg = cfg
         self.build_data_loader()
         self.build_model()
@@ -101,6 +104,7 @@ class Trainer:
         cfg = self.cfg
         if not 0 <= cfg.fusion_weight <= 1:
             raise ValueError("fusion_weight must be in [0, 1]")
+        print("Building model")
         print(f"Loading CLIP (backbone: {cfg.backbone})")
         self.clip_model = load_clip_to_cpu(cfg.backbone, cfg.prec).to(self.device)
         if cfg.zero_shot:
@@ -142,36 +146,24 @@ class Trainer:
             for _ in range(cfg.augmentation_time):
                 yield from tqdm(self.train_loader, desc=f"RAIL task {len(self.seen_tasks) + 1}", ascii=True)
 
-        start = time.time()
+        time_start = time.time()
         self.model.eval()
         self.model.analytic_adaption(len(self.seen_tasks), task_cfg, training_batches())
         self.seen_tasks.append(cfg.dataset)
         self.seen_classnames.extend(self.classnames)
-        print(f"Analytic training finished in {time.time() - start:.1f}s; learned {self.total_num_classes} classes")
+        torch.cuda.empty_cache()
+
+        print("Finish training")
+        elapsed = round(time.time() - time_start)
+        elapsed = str(datetime.timedelta(seconds=elapsed))
+        print(f"Time elapsed: {elapsed}")
+
+        # RAIL updates its analytic state during fitting; no prototypes to update.
+        # Save model
         self.save_model(cfg.output_dir)
         self.test_cur_task()
         if cfg.continue_train:
             self.test_w_selector()
-
-    @torch.no_grad()
-    def _predict(self, images, use_selector=True):
-        """Reference RAIL fusion: softmax CLIP + raw analytic scores.
-
-        Only examples whose zero-shot winner is learned are fused. Analytic
-        columns are scattered into the original TAIL global class ordering.
-        """
-        output = self.model.zero_shot(images).softmax(dim=-1)
-        class_indices = self._learned_class_indices()
-        learned = torch.tensor(class_indices, device=images.device, dtype=torch.long)
-        mask = torch.isin(output.argmax(dim=-1), learned) if use_selector else torch.ones(
-            images.shape[0], device=images.device, dtype=torch.bool)
-        if mask.any():
-            analytic = self.model(images[mask])
-            padded = torch.zeros_like(output[mask])
-            padded[:, learned] = analytic.to(padded.dtype)
-            weight = self.cfg.fusion_weight
-            output[mask] = (1 - weight) * output[mask] + weight * padded
-        return output
 
     def _learned_class_indices(self):
         indices = []
@@ -185,30 +177,133 @@ class Trainer:
         return indices
 
     @torch.no_grad()
-    def _evaluate(self, loader, indices, predict, label_offset=0):
-        self.model.eval()
-        self.evaluator.reset(indices)
-        for images, labels in tqdm(loader, ascii=True):
-            images = images.to(self.device)
-            labels = labels.to(self.device) + label_offset
-            self.evaluator.process(predict(images), labels)
-        return self.evaluator.evaluate()
-
     def test_zero_shot(self):
-        return self._evaluate(self.TAIL_test_loader, self.indices, self.model)
+        self.model.eval()
+        self.evaluator.reset(self.indices)
 
+        print("==================================================================================")
+        print(f"Evaluate on the test set")
+        data_loader = self.TAIL_test_loader
+
+        for batch in tqdm(data_loader, ascii=True):
+            image = batch[0]
+            label = batch[1]
+            image = image.to(self.device)
+            label = label.to(self.device)
+
+            output = self.model(image)
+
+            self.evaluator.process(output, label)
+
+        results = self.evaluator.evaluate()
+
+        return results
+
+    @torch.no_grad()
     def test_cur_task(self):
-        # Task-local labels and classifier columns; keep the existing evaluator.
-        start = self.previous_num_classes
-        return self._evaluate(self.test_loader, [0], lambda images: self.model(images)[:, start:])
+        self.model.eval()
+        indices = [0]
+        self.evaluator.reset(indices)
 
+        print("==================================================================================")
+        print(f"Evaluate on the current task test set")
+        data_loader = self.test_loader
+
+        for batch in tqdm(data_loader, ascii=True):
+            image = batch[0]
+            label = batch[1]
+            image = image.to(self.device)
+            label = label.to(self.device)
+
+            # The loader uses task-local labels. Select this task's RAIL columns.
+            output = self.model(image)[:, self.previous_num_classes:]
+
+            self.evaluator.process(output, label)
+
+        results = self.evaluator.evaluate()
+
+        return results
+
+    @torch.no_grad()
     def test_w_selector(self):
-        return self._evaluate(self.TAIL_test_loader, self.indices, self._predict)
+        '''
+        Use frozen CLIP to select images from learned classes, then fuse their
+        CLIP probabilities and analytic scores as in primal RAIL. Images from
+        unseen classes retain their zero-shot probabilities.
+        '''
+        cfg = self.cfg
+        self.model.eval()
+        indices = self.indices
+        self.evaluator.reset(indices)
 
+        data_loader = self.TAIL_test_loader
+        # RAIL already owns the frozen CLIP and all zero-shot text features.
+        learned_classes = torch.tensor(self._learned_class_indices(), device=self.device)
+
+        print("==================================================================================")
+        print(f"Evaluate on the X-TAIL test set")
+
+        for batch in tqdm(data_loader, ascii=True):
+            image = batch[0]
+            label = batch[1]
+            image = image.to(self.device)
+            label = label.to(self.device)
+
+            zs_output = self.model.zero_shot(image).softmax(dim=-1)
+            zs_pred = zs_output.max(1)[1]
+            id_indices = torch.isin(zs_pred, learned_classes).nonzero(as_tuple=True)[0]
+
+            output = zs_output.clone()
+            if id_indices.numel() > 0:
+                id_image = image[id_indices]
+                id_output = self.model(id_image)
+                # Map analytic columns into the existing TAIL class ordering.
+                id_output_padded = torch.zeros_like(zs_output[id_indices])
+                id_output_padded[:, learned_classes] = id_output.to(zs_output.dtype)
+                output[id_indices] = ((1 - cfg.fusion_weight) * zs_output[id_indices]
+                                      + cfg.fusion_weight * id_output_padded)
+
+            self.evaluator.process(output, label)
+
+        results = self.evaluator.evaluate()
+
+        return results
+
+    @torch.no_grad()
     def test_wo_selector(self):
-        # Explicit ablation: fuse every sample, including unseen-domain images.
-        return self._evaluate(self.TAIL_test_loader, self.indices,
-                              lambda images: self._predict(images, use_selector=False))
+        '''
+        RAIL ablation: fuse analytic scores for all images without selecting
+        learned-domain images. Retain the original standalone evaluation loop.
+        '''
+        cfg = self.cfg
+        self.model.eval()
+        indices = self.indices
+        self.evaluator.reset(indices)
+
+        data_loader = self.TAIL_test_loader
+        learned_classes = torch.tensor(self._learned_class_indices(), device=self.device)
+
+        print("==================================================================================")
+        print(f"Evaluate on the X-TAIL test set")
+
+        for batch in tqdm(data_loader, ascii=True):
+            image = batch[0]
+            label = batch[1]
+            image = image.to(self.device)
+            label = label.to(self.device)
+
+            zs_output = self.model.zero_shot(image).softmax(dim=-1)
+            analytic_output = self.model(image)
+            analytic_output_padded = torch.zeros_like(zs_output)
+            analytic_output_padded[:, learned_classes] = analytic_output.to(zs_output.dtype)
+            output = ((1 - cfg.fusion_weight) * zs_output
+                      + cfg.fusion_weight * analytic_output_padded)
+
+            self.evaluator.process(output, label)
+
+        results = self.evaluator.evaluate()
+
+        return results
 
     @torch.no_grad()
     def save_model(self, directory):

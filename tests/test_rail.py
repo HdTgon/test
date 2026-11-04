@@ -78,31 +78,47 @@ class RAILTests(unittest.TestCase):
                     model.analytic_adaption(1, cfg, [])
 
     def test_reference_fusion_seen_and_unseen(self):
-        # Include negative analytic scores: unseen padding must not be confused
-        # with selecting a class, and unselected rows must stay exactly CLIP.
+        # Exercise the public evaluation loops and inspect scores sent to the
+        # evaluator, including negative analytic scores and unseen examples.
         trainer = Trainer.__new__(Trainer)
         trainer.cfg = SimpleNamespace(fusion_weight=0.8)
+        trainer.device = torch.device('cpu')
+        trainer.indices = [0, 2]
+        trainer.evaluator = unittest.mock.Mock()
         logits = torch.tensor([[5., 1., 0.], [0., 1., 5.]])
         trainer.model = unittest.mock.Mock()
         trainer.model.zero_shot.return_value = logits
         trainer.model.return_value = torch.tensor([[-0.2, 0.4]])
         trainer._learned_class_indices = lambda: [0, 1]
         x = torch.zeros(2, 3, 8, 8)
-        result = trainer._predict(x)
+        labels = torch.tensor([0, 2])
+        trainer.TAIL_test_loader = [(x, labels)]
+        trainer.test_w_selector()
+        result, actual_labels = trainer.evaluator.process.call_args.args
         expected = logits.softmax(-1)
         expected[0] = 0.2 * expected[0] + 0.8 * torch.tensor([-0.2, 0.4, 0.])
         torch.testing.assert_close(result, expected)
+        torch.testing.assert_close(actual_labels, labels)
+        trainer.evaluator.reset.assert_called_once_with([0, 2])
         self.assertEqual(trainer.model.call_args.args[0].shape[0], 1)
+
         trainer.model.zero_shot.return_value = logits[1:]
         trainer.model.reset_mock()
-        torch.testing.assert_close(trainer._predict(x[1:]), logits[1:].softmax(-1))
+        trainer.TAIL_test_loader = [(x[1:], labels[1:])]
+        trainer.test_w_selector()
+        result = trainer.evaluator.process.call_args.args[0]
+        torch.testing.assert_close(result, logits[1:].softmax(-1))
         trainer.model.assert_not_called()
-        # A standalone task may occupy non-prefix global class columns.
+
+        # Without a selector, fuse every row into the correct global columns.
         trainer._learned_class_indices = lambda: [1, 2]
         trainer.model.zero_shot.return_value = logits
         trainer.model.return_value = torch.tensor([[0.3, -0.1], [0.1, 0.6]])
+        trainer.TAIL_test_loader = [(x, labels)]
+        trainer.test_wo_selector()
+        result = trainer.evaluator.process.call_args.args[0]
         expected = 0.2 * logits.softmax(-1) + 0.8 * torch.tensor([[0., 0.3, -0.1], [0., 0.1, 0.6]])
-        torch.testing.assert_close(trainer._predict(x, use_selector=False), expected)
+        torch.testing.assert_close(result, expected)
 
     def test_trainer_original_loaders_resume_and_config(self):
         base = tiny_clip()
