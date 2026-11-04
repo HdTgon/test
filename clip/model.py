@@ -184,7 +184,13 @@ class ResidualAttentionBlock(nn.Module):
 
     def forward(self, x: torch.Tensor):
         x = x + self.attention(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        x_mlp = self.ln_2(x)
+        for layer in self.mlp:
+            x_mlp = layer(x_mlp)
+            # MoRAM_Linear returns (features, loss); ordinary layers return tensors.
+            if isinstance(x_mlp, tuple):
+                x_mlp, _ = x_mlp
+        x = x + x_mlp
         return x
 
 
@@ -216,7 +222,7 @@ class VisionTransformer(nn.Module):
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, get_l12=False):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
@@ -230,8 +236,14 @@ class VisionTransformer(nn.Module):
 
         x = self.ln_post(x[:, 0, :])
 
+        if get_l12:
+            image_l12 = x
+
         if self.proj is not None:
             x = x @ self.proj
+
+        if get_l12:
+            return x, image_l12
 
         return x
 

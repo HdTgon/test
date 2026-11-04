@@ -47,6 +47,25 @@ class RAILTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(17)
 
+    def test_visual_layer12_features(self):
+        model = CLIP(embed_dim=8, image_resolution=8, vision_layers=12,
+                     vision_width=64, vision_patch_size=4, context_length=77,
+                     vocab_size=49408, transformer_width=64,
+                     transformer_heads=1, transformer_layers=1).eval()
+        images = torch.randn(2, 3, 8, 8)
+        captured = []
+        hook = model.visual.transformer.resblocks[11].register_forward_hook(
+            lambda module, inputs, output: captured.append(output.detach()))
+        with torch.no_grad():
+            projected, layer12 = model.visual(images, get_l12=True)
+            hook.remove()
+            default = model.encode_image(images)
+        self.assertEqual(layer12.shape, (2, 64))
+        self.assertEqual(projected.shape, (2, 8))
+        torch.testing.assert_close(layer12, model.visual.ln_post(captured[0][0]))
+        torch.testing.assert_close(projected, layer12 @ model.visual.proj)
+        torch.testing.assert_close(projected, default)
+
     def test_recursive_fit_matches_joint_ridge(self):
         for expansion in (False, True):
             with self.subTest(expansion=expansion):
