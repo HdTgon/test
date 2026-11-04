@@ -70,8 +70,8 @@ class Evaluator:
             task_selection_precision.append(correct / total * 100 if total else 0.0)
 
         for id in task_id:
-            print(f"* Task {id} selection Recall: {task_selection_recall[id]:.1f}% | Precision: {task_selection_precision[id]:.1f}%")
-        print(f"* Average Task selection Recall: {np.mean(task_selection_recall):.1f}% | Precision: {np.mean(task_selection_precision):.1f}%\n")
+            print(f"* Task {id} selection Recall: {task_selection_recall[id]:.3f}% | Precision: {task_selection_precision[id]:.3f}%")
+        print(f"* Average Task selection Recall: {np.mean(task_selection_recall):.3f}% | Precision: {np.mean(task_selection_precision):.3f}%\n")
 
         self._per_class_res = defaultdict(list)
 
@@ -105,8 +105,8 @@ class Evaluator:
                 acc_list.append(np.sum(cls_correct[indices[i]:]) / np.sum(cls_total[indices[i]:]) * 100)
 
         for i in range(len(acc_list)):
-            print(f"* Task {i} Accuracy: {acc_list[i]:.1f}%")
-        print(f"* Average Accuracy: {np.mean(acc_list):.1f}%")
+            print(f"* Task {i} Accuracy: {acc_list[i]:.3f}%")
+        print(f"* Average Accuracy: {np.mean(acc_list):.3f}%")
         
         return results
 
