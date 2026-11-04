@@ -2,6 +2,55 @@
 
 This is the source code for our paper "LADA: Scalable Label-Specific CLIP Adapter for Continual Learning" which has been accepted to **ICML 2025**.
 
+> This fork uses primal RAIL for training and inference. The original LADA
+> dataset loaders, preprocessing, task order, CLI, and result-log format are retained.
+> Algorithm reference: [Regression-based Analytic Incremental Learning](https://github.com/linghan1997/Regression-based-Analytic-Incremental-Learning).
+>
+> Training freezes CLIP and the random expansion layer. The first task solves
+> regularized least squares; later tasks update the inverse covariance and
+> classifier recursively, with task-local labels offset to learned-class indices.
+> There is no gradient optimization, text tuning, prototype replay, or LADA adapter.
+> Inference uses CLIP scores at temperature 100, applies softmax, and fuses the
+> raw analytic scores only when CLIP's predicted class belongs to a learned task:
+> `(1 - fusion_weight) * softmax(CLIP) + fusion_weight * padded_analytic_scores`.
+> Unselected examples retain their zero-shot probabilities.
+
+## RAIL configuration and checkpoints
+
+`configs/model/clip_vit_b16.yaml` defaults to the reference primal settings:
+`feature_expansion: True`, `hidden_dim: 15000`, `regularization: 0.1`,
+`fusion_weight: 0.8`, and `augmentation_time: 1`.
+Expansion is fixed Linear + ReLU; disabling it fits normalized CLIP features.
+A 15000-dimensional float32 covariance alone occupies about 0.9 GB; the solve
+and recursive updates require additional memory. Reduce `hidden_dim` for smoke tests.
+
+Keep the existing dataset preparation below and set `root` to the dataset directory.
+The existing scripts still run tasks in order. Old `num_epochs` arguments are
+accepted for CLI compatibility but have no effect: each task is fitted in one
+pass per `augmentation_time`, using the existing augmented training loader.
+For example, the first two tasks are:
+
+```bash
+python main.py -d TAIL -m clip_vit_b16 root /path/to/datasets dataset aircraft continue_train_first True output_dir RAIL_16shot
+python main.py -d TAIL -m clip_vit_b16 root /path/to/datasets dataset caltech101 output_dir RAIL_16shot
+```
+
+The first task must set `continue_train_first True`. Later tasks resume the
+checkpoint in the same output directory (or `model_dir`), following
+`dataset_sequence`. Checkpoints save the expansion weights, inverse covariance,
+analytic classifier, learned tasks and class ordering, and algorithm settings.
+The same pretrained CLIP backbone is reloaded normally. Old LADA checkpoints
+cannot be reused; start a new output directory. `test_cur_task` evaluates the
+current task's analytic classifier; `test_w_selector` evaluates reference RAIL
+fusion across all tasks, including unseen ones. `test_wo_selector` is an explicit
+ablation that fuses all samples. Zero-shot mode remains available unchanged.
+
+Run CPU regression tests without downloading datasets or pretrained weights:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 ## Requirements
 
 * Python 3.10
@@ -81,19 +130,19 @@ Path/To/Dataset/Folder
 
 ### Reproduction
 
-To reproduce the main result in the paper, please run
+To run this fork's RAIL pipeline with the original dataset/task scripts, run
 
 ```bash
-# run LADA on 16-shot order-I setting
+# run RAIL on 16-shot order-I setting
 bash scripts/run_TAIL_16shot.sh
 
-# run LADA on 16-shot order-II setting
+# run RAIL on 16-shot order-II setting
 bash scripts/run_TAIL_16shot_order2.sh
 
-# run LADA on full-shot order-I setting
+# run RAIL on full-shot order-I setting
 bash scripts/run_TAIL_fullshot.sh
 
-# run LADA on full-shot order-II setting
+# run RAIL on full-shot order-II setting
 bash scripts/run_TAIL_fullshot_order2.sh
 ```
 

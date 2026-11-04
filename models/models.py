@@ -172,5 +172,8 @@ class RAILCLIP(ZeroShotCLIP):
 
     def zero_shot(self, images, clip_weights=None):
         if clip_weights is None:
-            return super().forward(images)
-        return self.logit_scale * self.encode_images(images) @ clip_weights
+            if self.text_features is None:
+                raise RuntimeError('Call init_text_features before zero-shot inference')
+            clip_weights = self.text_features.t()
+        # The reference RAIL fusion uses a fixed CLIP temperature of 100.
+        return 100.0 * self.encode_images(images) @ clip_weights

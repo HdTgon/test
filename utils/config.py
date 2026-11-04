@@ -51,3 +51,10 @@ _C.beta = 1.0
 _C.zero_shot = False  # zero-shot CLIP
 _C.continue_train = False
 _C.continue_train_first = False
+
+# Primal RAIL: fixed random expansion, ridge regularization, gated fusion.
+_C.feature_expansion = True
+_C.hidden_dim = 15000
+_C.regularization = 0.1
+_C.fusion_weight = 0.8
+_C.augmentation_time = 1

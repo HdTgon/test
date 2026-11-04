@@ -13,14 +13,10 @@ prec: "amp"
 
 continue_train: True
 continue_train_first: False
-num_epochs: 20
+# Primal RAIL fits analytically; num_epochs/lr/PEFT options are unused.
 batch_size: 64
-lr: 0.001
-weight_decay: 5e-4
-loss_type: "CE"
-lada_k: 16      # lambda_1 in paper
-prototype_k: 4  # lambda_2 in paper
-image_prototypes_weight_coef: 64.0
-
-t_adaptformer: True
-t_adapter_dim: 16
+feature_expansion: True
+hidden_dim: 15000
+regularization: 0.1
+fusion_weight: 0.8
+augmentation_time: 1

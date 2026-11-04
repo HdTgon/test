@@ -67,7 +67,7 @@ class Evaluator:
             res = self._task_selection_precision[id]
             correct = sum(res)
             total = len(res)
-            task_selection_precision.append(correct / total * 100)
+            task_selection_precision.append(correct / total * 100 if total else 0.0)
 
         for id in task_id:
             print(f"* Task {id} selection Recall: {task_selection_recall[id]:.1f}% | Precision: {task_selection_precision[id]:.1f}%")
